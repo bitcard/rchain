@@ -9,6 +9,7 @@ import cats.{Applicative, Monad}
 import com.google.protobuf.{ByteString, Int32Value, StringValue}
 import coop.rchain.blockstorage.BlockStore
 import coop.rchain.blockstorage.dag.BlockDagRepresentation
+import coop.rchain.blockstorage.syntax._
 import coop.rchain.casper.PrettyPrinter
 import coop.rchain.casper.protocol.{DeployData, _}
 import coop.rchain.casper.util.implicits._
@@ -62,7 +63,7 @@ object ProtoUtil {
       mainChain <- maybeMainParentHash match {
                     case Some(mainParentHash) =>
                       for {
-                        updatedEstimate <- getBlock(mainParentHash)
+                        updatedEstimate <- BlockStore[F].getUnsafe(mainParentHash)
                         depthDelta      = blockNumber(updatedEstimate) - blockNumber(estimate)
                         newDepth        = depth + depthDelta.toInt
                         mainChain <- if (newDepth <= 0) {
@@ -79,23 +80,6 @@ object ProtoUtil {
                   }
     } yield mainChain
   }
-
-  def getBlock[F[_]: Sync: BlockStore](hash: BlockHash): F[BlockMessage] =
-    BlockStore[F].get(hash) >>= (Sync[F].fromOption(
-      _,
-      new Exception(s"BlockStore is missing hash ${PrettyPrinter.buildString(hash)}")
-    ))
-
-  def getBlockMetadata[F[_]: Sync](
-      hash: BlockHash,
-      dag: BlockDagRepresentation[F]
-  ): F[BlockMetadata] =
-    dag.lookup(hash) >>= (
-      Sync[F].fromOption(
-        _,
-        new Exception(s"DAG storage is missing hash ${PrettyPrinter.buildString(hash)}")
-      )
-    )
 
   def creatorJustification(block: BlockMessage): Option[Justification] =
     block.justifications.find(_.validator == block.sender)
@@ -194,7 +178,7 @@ object ProtoUtil {
 
   def getParents[F[_]: Sync: BlockStore](b: BlockMessage): F[List[BlockMessage]] = {
     import cats.instances.list._
-    parentHashes(b).traverse(getBlock[F])
+    parentHashes(b).traverse(BlockStore[F].getUnsafe)
   }
 
   def getParentsMetadata[F[_]: Sync](
@@ -202,7 +186,7 @@ object ProtoUtil {
       dag: BlockDagRepresentation[F]
   ): F[List[BlockMetadata]] = {
     import cats.instances.list._
-    b.parents.traverse(getBlockMetadata(_, dag))
+    b.parents.traverse(dag.lookupUnsafe)
   }
 
   def getParentMetadatasAboveBlockNumber[F[_]: Sync](
@@ -238,6 +222,12 @@ object ProtoUtil {
     case (acc, b) => math.max(acc, b.blockNum)
   }
 
+  def justificationsToJustificationInfos(justification: Justification) =
+    JustificationInfo(
+      PrettyPrinter.buildStringNoLimit(justification.validator),
+      PrettyPrinter.buildStringNoLimit(justification.latestBlockHash)
+    )
+
   def toJustification(
       latestMessages: collection.Map[Validator, BlockMetadata]
   ): Seq[Justification] =
@@ -268,7 +258,7 @@ object ProtoUtil {
                             .getOrElse(
                               Sync[F].raiseError(
                                 new RuntimeException(
-                                  s"Could not find a block for $hash in the DAG storage"
+                                  s"Could not find a block for ${PrettyPrinter.buildString(hash)} in the DAG storage"
                                 )
                               )
                             )
@@ -468,7 +458,7 @@ object ProtoUtil {
         List.empty[BlockMetadata].pure
     }
 
-  def invalidLatestMessages[F[_]: Monad](
+  def invalidLatestMessages[F[_]: Sync](
       dag: BlockDagRepresentation[F]
   ): F[Map[Validator, BlockHash]] =
     dag.latestMessages.flatMap(

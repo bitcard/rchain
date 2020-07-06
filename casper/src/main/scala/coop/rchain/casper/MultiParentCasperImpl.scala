@@ -9,6 +9,7 @@ import coop.rchain.blockstorage.dag.{BlockDagRepresentation, BlockDagStorage}
 import coop.rchain.blockstorage.dag.BlockDagStorage.DeployId
 import coop.rchain.casper.CasperState.CasperStateCell
 import coop.rchain.casper.protocol._
+import coop.rchain.casper.syntax._
 import coop.rchain.casper.util._
 import coop.rchain.casper.util.ProtoUtil._
 import coop.rchain.casper.util.comm.CommUtil
@@ -238,7 +239,7 @@ class MultiParentCasperImpl[F[_]: Sync: Concurrent: Log: Time: SafetyOracle: Las
               RChainEvent.blockFinalised(updatedLastFinalizedBlockHash.base16String)
             )
             .whenA(lastFinalizedBlockHash != updatedLastFinalizedBlockHash)
-      blockMessage <- ProtoUtil.getBlock(updatedLastFinalizedBlockHash)
+      blockMessage <- BlockStore[F].getUnsafe(updatedLastFinalizedBlockHash)
     } yield blockMessage
 
   def blockDag: F[BlockDagRepresentation[F]] =
@@ -276,7 +277,16 @@ class MultiParentCasperImpl[F[_]: Sync: Concurrent: Log: Time: SafetyOracle: Las
                 .map {
                   case Left(ex)       => Left(ex)
                   case Right(Some(_)) => Right(BlockStatus.valid)
-                  case Right(None)    => Left(BlockStatus.invalidTransaction)
+                  case Right(None) =>
+                    val isOwnBlock = PublicKey(b.sender).some == validatorId.map(_.publicKey)
+                    if (!isOwnBlock) Left(BlockStatus.invalidTransaction)
+                    else
+                      // Prevent validator to slash itself for invalid block
+                      Left(
+                        BlockStatus.exception(
+                          new Exception("Validation of own block failed, adding block canceled.")
+                        )
+                      )
                 }
             )
         _      <- EitherT.liftF(Span[F].mark("transactions-validated"))

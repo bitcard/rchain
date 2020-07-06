@@ -13,8 +13,8 @@ import cats.mtl._
 import cats.tagless.implicits._
 import com.typesafe.config.Config
 import coop.rchain.blockstorage._
-import coop.rchain.blockstorage.dag.{BlockDagFileStorage, BlockDagStorage}
-import coop.rchain.blockstorage.deploy.{InMemDeployStorage, LMDBDeployStorage}
+import coop.rchain.blockstorage.dag.{BlockDagFileStorage, BlockDagKeyValueStorage, BlockDagStorage}
+import coop.rchain.blockstorage.deploy.LMDBDeployStorage
 import coop.rchain.blockstorage.finality.LastFinalizedFileStorage
 import coop.rchain.blockstorage.util.io.IOError
 import coop.rchain.casper.{ReportingCasper, _}
@@ -23,6 +23,7 @@ import coop.rchain.casper.engine.EngineCell._
 import coop.rchain.casper.engine.Running.Requested
 import coop.rchain.casper.protocol.deploy.v1.DeployServiceV1GrpcMonix
 import coop.rchain.casper.protocol.propose.v1.ProposeServiceV1GrpcMonix
+import coop.rchain.casper.storage.RNodeKeyValueStoreManager
 import coop.rchain.casper.util.comm._
 import coop.rchain.casper.util.rholang.RuntimeManager
 import coop.rchain.catscontrib.Catscontrib._
@@ -37,8 +38,10 @@ import coop.rchain.comm.transport._
 import coop.rchain.grpc.Server
 import coop.rchain.metrics.{Metrics, Span}
 import coop.rchain.models.BlockHash.BlockHash
+import coop.rchain.models.{BindPattern, ListParWithRandom, Par, TaggedContinuation}
 import coop.rchain.node.NodeRuntime.{apply => _, _}
 import coop.rchain.node.api.WebApi.WebApiImpl
+import coop.rchain.node.api.AdminWebApi.AdminWebApiImpl
 import coop.rchain.node.api._
 import coop.rchain.node.configuration.{Configuration, NodeConf}
 import coop.rchain.node.diagnostics.{NewPrometheusReporter, _}
@@ -51,6 +54,7 @@ import coop.rchain.rholang.interpreter.Runtime
 import coop.rchain.rspace.Context
 import coop.rchain.shared._
 import coop.rchain.shared.PathOps._
+import coop.rchain.store.KeyValueStoreManager
 import kamon._
 import kamon.system.SystemMetrics
 import kamon.zipkin.ZipkinReporter
@@ -141,13 +145,12 @@ class NodeRuntime private[node] (
     requestedBlocks <- Cell.mvarCell[Task, Map[BlockHash, Running.Requested]](Map.empty).toReaderT
     commUtil = CommUtil.of[Task](
       Concurrent[Task],
-      log,
-      time,
-      metrics,
       transport,
-      rpConnections,
       rpConfAsk,
-      requestedBlocks
+      rpConnections,
+      requestedBlocks,
+      log,
+      time
     )
 
     kademliaRPC = effects.kademliaRPC(
@@ -257,7 +260,8 @@ class NodeRuntime private[node] (
       engineInit,
       casperLaunch,
       reportingCasper,
-      webApi
+      webApi,
+      adminWebApi
     ) = result
 
     // 4. launch casper
@@ -271,7 +275,8 @@ class NodeRuntime private[node] (
       engineInit,
       runtimeCleanup,
       reportingCasper,
-      webApi
+      webApi,
+      adminWebApi
     )(
       logEnv,
       timeEnv,
@@ -287,7 +292,6 @@ class NodeRuntime private[node] (
       nodeDiscoveryEnv,
       rpConnections,
       rpConnectionsEnv,
-      blockDagStorage,
       blockStore,
       packetHandler,
       eventLogEnv,
@@ -317,7 +321,8 @@ class NodeRuntime private[node] (
       engineInit: EngineInit[TaskEnv],
       runtimeCleanup: Cleanup[TaskEnv],
       reportingCasper: ReportingCasper[TaskEnv],
-      webApi: WebApi[TaskEnv]
+      webApi: WebApi[TaskEnv],
+      adminWebApi: AdminWebApi[TaskEnv]
   )(
       implicit
       logEnv: Log[TaskEnv],
@@ -334,7 +339,6 @@ class NodeRuntime private[node] (
       nodeDiscovery: NodeDiscovery[TaskEnv],
       rpConnections: ConnectionsCell[Task],
       rpConnectionsEnv: ConnectionsCell[TaskEnv],
-      blockDagStorage: BlockDagStorage[TaskEnv],
       blockStore: BlockStore[TaskEnv],
       packetHandler: PacketHandler[TaskEnv],
       eventLog: EventLog[TaskEnv],
@@ -392,7 +396,7 @@ class NodeRuntime private[node] (
       _     <- info
       local <- peerNodeAsk.ask
       host  = local.endpoint.host
-      servers <- acquireServers(apiServers, reportingCasper, webApi)(
+      servers <- acquireServers(apiServers, reportingCasper, webApi, adminWebApi)(
                   kademliaStore,
                   nodeDiscoveryTask,
                   rpConnections,
@@ -401,7 +405,7 @@ class NodeRuntime private[node] (
                   rpConfAsk,
                   consumer
                 ).toReaderT
-      _ <- addShutdownHook(servers, runtimeCleanup)
+      _ <- addShutdownHook(servers, runtimeCleanup, blockStore)
       _ <- servers.externalApiServer.start.toReaderT
 
       _ <- Log[TaskEnv].info(
@@ -417,6 +421,10 @@ class NodeRuntime private[node] (
       // HTTP server is started immediately on `acquireServers`
       _ <- Log[TaskEnv].info(
             s"HTTP API server started at ${nodeConf.apiServer.host}:${nodeConf.apiServer.portHttp}"
+          )
+
+      _ <- Log[TaskEnv].info(
+            s"Admin HTTP API server started at ${nodeConf.apiServer.host}:${nodeConf.apiServer.portAdminHttp}"
           )
 
       _ <- Log[TaskEnv].info(
@@ -461,23 +469,19 @@ class NodeRuntime private[node] (
 
   def addShutdownHook(
       servers: Servers,
-      runtimeCleanup: Cleanup[TaskEnv]
-  )(
-      implicit blockStore: BlockStore[TaskEnv],
-      blockDagStorage: BlockDagStorage[TaskEnv],
-      log: Log[TaskEnv]
-  ): TaskEnv[Unit] =
-    Task.delay(sys.addShutdownHook(clearResources(servers, runtimeCleanup))).as(()).toReaderT
+      runtimeCleanup: Cleanup[TaskEnv],
+      blockStore: BlockStore[TaskEnv]
+  )(implicit log: Log[TaskEnv]): TaskEnv[Unit] =
+    Task
+      .delay(sys.addShutdownHook(clearResources(servers, runtimeCleanup, blockStore)))
+      .as(())
+      .toReaderT
 
   def clearResources(
       servers: Servers,
-      runtimeCleanup: Cleanup[TaskEnv]
-  )(
-      implicit
-      blockStore: BlockStore[TaskEnv],
-      blockDagStorage: BlockDagStorage[TaskEnv],
-      log: Log[TaskEnv]
-  ): Unit =
+      runtimeCleanup: Cleanup[TaskEnv],
+      blockStore: BlockStore[TaskEnv]
+  )(implicit log: Log[TaskEnv]): Unit =
     (for {
       _ <- Log[TaskEnv].info("Shutting down API servers...")
       _ <- servers.externalApiServer.stop.toReaderT
@@ -490,8 +494,6 @@ class NodeRuntime private[node] (
       _ <- Task.delay(Kamon.stopAllReporters()).toReaderT
       _ <- servers.httpServer.cancel.attempt.toReaderT
       _ <- runtimeCleanup.close()
-      _ <- Log[TaskEnv].info("Bringing DagStorage down ...")
-      _ <- blockDagStorage.close()
       _ <- Log[TaskEnv].info("Bringing BlockStore down ...")
       _ <- blockStore.close()
       _ <- Log[TaskEnv].info("Goodbye.")
@@ -515,13 +517,15 @@ class NodeRuntime private[node] (
       transportServer: TransportServer,
       externalApiServer: Server[Task],
       internalApiServer: Server[Task],
-      httpServer: Fiber[Task, Unit]
+      httpServer: Fiber[Task, Unit],
+      adminHttpServer: Fiber[Task, Unit]
   )
 
   def acquireServers(
       apiServers: APIServers,
       reportingCasper: ReportingCasper[TaskEnv],
-      webApi: WebApi[TaskEnv]
+      webApi: WebApi[TaskEnv],
+      adminWebApi: AdminWebApi[TaskEnv]
   )(
       implicit
       kademliaStore: KademliaStore[Task],
@@ -600,8 +604,15 @@ class NodeRuntime private[node] (
         reportingCasper,
         webApi,
         nodeConf.apiServer.maxConnectionIdle
-      )(nodeDiscovery, connectionsCell, concurrent, rPConfAsk, consumer, s)
+      )(nodeDiscovery, connectionsCell, concurrent, rPConfAsk, consumer, s, log)
       httpFiber <- httpServerFiber.start
+      adminHttpServerFiber = aquireAdminHttpServer(
+        nodeConf.apiServer.host,
+        nodeConf.apiServer.portAdminHttp,
+        adminWebApi,
+        nodeConf.apiServer.maxConnectionIdle
+      )(concurrent, consumer, s)
+      adminHttpFiber <- adminHttpServerFiber.start
       _ <- Task.delay {
             Kamon.reconfigure(kamonConf.withFallback(Kamon.config()))
             if (nodeConf.metrics.influxdb) Kamon.addReporter(new BatchInfluxDBReporter())
@@ -615,7 +626,8 @@ class NodeRuntime private[node] (
       transportServer,
       externalApiServer,
       internalApiServer,
-      httpFiber
+      httpFiber,
+      adminHttpFiber
     )
   }
 }
@@ -658,7 +670,8 @@ object NodeRuntime {
   def cleanup[F[_]: Sync: Log](
       runtime: Runtime[F],
       casperRuntime: Runtime[F],
-      deployStorageCleanup: F[Unit]
+      deployStorageCleanup: F[Unit],
+      casperStoreManager: KeyValueStoreManager[F]
   ): Cleanup[F] =
     new Cleanup[F] {
       override def close(): F[Unit] =
@@ -667,6 +680,8 @@ object NodeRuntime {
           _ <- runtime.close()
           _ <- Log[F].info("Shutting down Casper runtime ...")
           _ <- casperRuntime.close()
+          _ <- Log[F].info("Shutting down Casper store manager ...")
+          _ <- casperStoreManager.shutdown
           _ <- Log[F].info("Shutting down deploy storage ...")
           _ <- deployStorageCleanup
         } yield ()
@@ -692,7 +707,7 @@ object NodeRuntime {
   ): F[
     (
         BlockStore[F],
-        BlockDagFileStorage[F],
+        BlockDagStorage[F],
         Cleanup[F],
         PacketHandler[F],
         APIServers,
@@ -701,7 +716,8 @@ object NodeRuntime {
         EngineInit[F],
         CasperLaunch[F],
         ReportingCasper[F],
-        WebApi[F]
+        WebApi[F],
+        AdminWebApi[F]
     )
   ] =
     for {
@@ -718,7 +734,20 @@ object NodeRuntime {
         diagnostics.effects
           .span(conf.protocolServer.networkId, conf.protocolServer.host.getOrElse("-"))
       else Span.noop[F]
-      blockDagStorage                       <- BlockDagFileStorage.create[F](dagConfig)
+      // Key-value store manager / manages LMDB databases
+      casperStoreManager <- RNodeKeyValueStoreManager(conf.storage.dataDir)
+      blockDagStorage <- {
+        implicit val kvm = casperStoreManager
+        for {
+          // Check if migration from DAG file storage to LMDB should be executed
+          blockMetadataDb  <- casperStoreManager.database("block-metadata")
+          dagStrageIsEmpty <- blockMetadataDb.iterate(_.isEmpty)
+          // TODO: remove `dagConfig`, it's not used anymore (after migration)
+          _ <- BlockDagKeyValueStorage.importFromFileStorage(dagConfig).whenA(dagStrageIsEmpty)
+          // Create DAG store
+          dagStorage <- BlockDagKeyValueStorage.create[F]
+        } yield dagStorage
+      }
       lastFinalizedStorage                  <- LastFinalizedFileStorage.make[F](lastFinalizedPath)
       deployStorageAllocation               <- LMDBDeployStorage.make[F](deployStorageConfig).allocated
       (deployStorage, deployStorageCleanup) = deployStorageAllocation
@@ -766,10 +795,21 @@ object NodeRuntime {
           sarAndHR            <- Runtime.setupRSpace[F](casperConf.storage, casperConf.size)
           (space, replay, hr) = sarAndHR
           runtime             <- Runtime.createWithEmptyCost[F]((space, replay), Seq.empty)
-          reporter = if (conf.apiServer.enableReporting)
-            ReportingCasper.rhoReporter(hr)
-          else
-            ReportingCasper.noop
+          reporter <- if (conf.apiServer.enableReporting) {
+                       import coop.rchain.rholang.interpreter.storage._
+                       implicit val kvm = casperStoreManager
+                       for {
+                         reportingCache <- ReportMemStore
+                                            .store[
+                                              F,
+                                              Par,
+                                              BindPattern,
+                                              ListParWithRandom,
+                                              TaggedContinuation
+                                            ]
+                       } yield ReportingCasper.rhoReporter(hr, reportingCache)
+                     } else
+                       ReportingCasper.noop.pure[F]
         } yield (runtime, reporter)
       }
       (casperRuntime, reportingCasper) = casperRuntimeAndReporter
@@ -845,9 +885,9 @@ object NodeRuntime {
         _      <- engine.withCasper(_.fetchDependencies, Applicative[F].unit)
         _ <- Running.maintainRequestedBlocks[F](conf.casper.requestedBlocksTimeout)(
               Monad[F],
+              TransportLayer[F],
               rpConfAsk,
               requestedBlocks,
-              TransportLayer[F],
               Log[F],
               Time[F],
               Metrics[F]
@@ -865,14 +905,28 @@ object NodeRuntime {
           _ <- Running.updateForkChoiceTipsIfStuck(conf.casper.forkChoiceStaleThreshold)
         } yield ()
       }
-      engineInit     = engineCell.read >>= (_.init)
-      runtimeCleanup = NodeRuntime.cleanup(evalRuntime, casperRuntime, deployStorageCleanup)
+      engineInit = engineCell.read >>= (_.init)
+      runtimeCleanup = NodeRuntime.cleanup(
+        evalRuntime,
+        casperRuntime,
+        deployStorageCleanup,
+        casperStoreManager
+      )
       webApi = {
         implicit val ec = engineCell
         implicit val sp = span
         implicit val or = oracle
         implicit val bs = blockStore
         new WebApiImpl[F](conf.apiServer.maxBlocksLimit)
+      }
+      adminWebApi = {
+        implicit val ec     = engineCell
+        implicit val sp     = span
+        implicit val or     = oracle
+        implicit val bs     = blockStore
+        implicit val sc     = synchronyConstraintChecker
+        implicit val lfhscc = lastFinalizedHeightConstraintChecker
+        new AdminWebApiImpl[F](conf.apiServer.maxBlocksLimit, blockApiLock)
       }
     } yield (
       blockStore,
@@ -885,7 +939,8 @@ object NodeRuntime {
       engineInit,
       casperLaunch,
       reportingCasper,
-      webApi
+      webApi,
+      adminWebApi
     )
 
   final case class APIServers(

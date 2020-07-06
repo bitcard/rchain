@@ -7,10 +7,11 @@ import cats.{Applicative, Monad}
 import com.google.protobuf.ByteString
 import coop.rchain.blockstorage.BlockStore
 import coop.rchain.blockstorage.dag.BlockDagRepresentation
+import coop.rchain.blockstorage.syntax._
 import coop.rchain.casper.protocol.{ApprovedBlock, BlockMessage, Justification}
-import coop.rchain.casper.util.{DagOperations, ProtoUtil}
 import coop.rchain.casper.util.ProtoUtil.bonds
 import coop.rchain.casper.util.rholang.RuntimeManager
+import coop.rchain.casper.util.{DagOperations, ProtoUtil}
 import coop.rchain.crypto.codec.Base16
 import coop.rchain.crypto.hash.Blake2b256
 import coop.rchain.crypto.signatures.Secp256k1
@@ -250,7 +251,7 @@ object Validate {
                                        )
                                        .findF { blockMetadata =>
                                          for {
-                                           block <- ProtoUtil.getBlock(
+                                           block <- BlockStore[F].getUnsafe(
                                                      blockMetadata.blockHash
                                                    )
                                            blockDeploys = ProtoUtil.deploys(block).map(_.deploy)
@@ -263,7 +264,7 @@ object Validate {
                      .traverse(
                        duplicatedBlockMetadata => {
                          for {
-                           duplicatedBlock <- ProtoUtil.getBlock(
+                           duplicatedBlock <- BlockStore[F].getUnsafe(
                                                duplicatedBlockMetadata.blockHash
                                              )
                            currentBlockHashString = PrettyPrinter.buildString(block.blockHash)
@@ -299,8 +300,8 @@ object Validate {
       beforeFuture = currentTime + DRIFT >= timestamp
       latestParentTimestamp <- ProtoUtil.parentHashes(b).foldM(0L) {
                                 case (latestTimestamp, parentHash) =>
-                                  ProtoUtil
-                                    .getBlock(parentHash)
+                                  BlockStore[F]
+                                    .getUnsafe(parentHash)
                                     .map(parent => {
                                       val timestamp = parent.header.timestamp
                                       math.max(latestTimestamp, timestamp)
@@ -540,7 +541,7 @@ object Validate {
     val justifiedValidators = b.justifications.map(_.validator).toSet
     val mainParentHash      = ProtoUtil.parentHashes(b).head
     for {
-      mainParent       <- ProtoUtil.getBlock(mainParentHash)
+      mainParent       <- BlockStore[F].getUnsafe(mainParentHash)
       bondedValidators = ProtoUtil.bonds(mainParent).map(_.validator).toSet
       status <- if (bondedValidators == justifiedValidators) {
                  BlockStatus.valid.asRight[BlockError].pure

@@ -7,6 +7,7 @@ import com.google.protobuf.ByteString
 import coop.rchain.blockstorage.BlockStore
 import coop.rchain.blockstorage.dag.BlockDagRepresentation
 import coop.rchain.blockstorage.deploy.DeployStorage
+import coop.rchain.blockstorage.syntax._
 import coop.rchain.casper.protocol._
 import coop.rchain.casper.util.ProtoUtil._
 import coop.rchain.casper.util.rholang.RuntimeManager.StateHash
@@ -42,6 +43,12 @@ object BlockCreator {
     } yield isActive
   }
 
+  private def isBonded[F[_]: Sync](
+      blockMeta: BlockMetadata,
+      validator: Validator
+  ): Boolean =
+    blockMeta.weightMap.getOrElse(validator, 0L) > 0L // consider stake greater than 0 as bonded
+
   /*
    * Overview of createBlock
    *
@@ -69,22 +76,27 @@ object BlockCreator {
         _                     <- spanF.mark("after-estimator")
         parentMetadatas       <- EstimatorHelper.chooseNonConflicting(tipHashes, dag)
         maxBlockNumber        = ProtoUtil.maxBlockNumberMetadata(parentMetadatas)
+        _                     <- Log[F].info(s"Creating block with maxBlockNumber ${maxBlockNumber}")
         invalidLatestMessages <- ProtoUtil.invalidLatestMessages(dag)
         deploys               <- extractDeploys(dag, parentMetadatas, maxBlockNumber, expirationThreshold)
         sender                = ByteString.copyFrom(validatorIdentity.publicKey.bytes)
         latestMessageOpt      <- dag.latestMessage(sender)
         seqNum                = latestMessageOpt.fold(0)(_.seqNum) + 1
+        _                     <- Log[F].info(s"Creating block with seqNum ${seqNum}")
+        // if the node is already not bonded by the parent, the node won't slash once more
+        invalidLatestMessagesExcludeUnbonded = invalidLatestMessages.filter {
+          case (validator, _) => isBonded(parentMetadatas.head, validator)
+        }
         // TODO: Add `slashingDeploys` to DeployStorage
-        slashingDeploys = invalidLatestMessages.values.toList.map(
+        slashingDeploys = invalidLatestMessagesExcludeUnbonded.values.map(
           invalidBlockHash =>
-            // TODO: Do something useful with the result of "slash".
             SlashDeploy(
               invalidBlockHash,
               validatorIdentity.publicKey,
               SystemDeployUtil.generateSlashDeployRandomSeed(sender, seqNum)
             )
         )
-        parents <- parentMetadatas.toList.traverse(p => ProtoUtil.getBlock(p.blockHash))
+        parents <- parentMetadatas.toList.traverse(p => BlockStore[F].getUnsafe(p.blockHash))
         // there are 3 situations on judging whether the validator is active
         // 1. it is possible that you are active in some parents but not active in other parents
         // 2. all of the parents are in active state
@@ -101,7 +113,7 @@ object BlockCreator {
         invalidBlocksSet <- dag.invalidBlocks
         invalidBlocks    = invalidBlocksSet.map(block => (block.blockHash, block.sender)).toMap
         // make sure closeBlock is the last system Deploy
-        systemDeploys = slashingDeploys :+ CloseBlockDeploy(
+        systemDeploys = slashingDeploys.toList :+ CloseBlockDeploy(
           SystemDeployUtil.generateCloseDeployRandomSeed(sender, seqNum)
         )
         unsignedBlock <- isActive.ifM(
@@ -167,7 +179,7 @@ object BlockCreator {
                  )
                  .foldLeftF(validDeploys) { (deploys, blockMetadata) =>
                    for {
-                     block        <- ProtoUtil.getBlock(blockMetadata.blockHash)
+                     block        <- BlockStore[F].getUnsafe(blockMetadata.blockHash)
                      blockDeploys = ProtoUtil.deploys(block).map(_.deploy)
                    } yield deploys -- blockDeploys
                  }
@@ -185,7 +197,7 @@ object BlockCreator {
    * any latest message not from a bonded validator will not change the
    * final fork-choice.
    */
-  private def computeJustifications[F[_]: Monad](
+  private def computeJustifications[F[_]: Sync](
       dag: BlockDagRepresentation[F],
       parents: Seq[BlockMessage]
   ): F[Seq[Justification]] = {

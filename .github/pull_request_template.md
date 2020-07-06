@@ -1,16 +1,9 @@
 ## Overview
-<sup>_What this PR does, and why it's needed_</sup>
-
-
-
-### JIRA ticket:
-<sup>_Create it if there isn't one already._</sup>
-
+<!-- What this PR does, and why it's needed -->
 
 
 ### Notes
-<sup>_Optional. Add any notes on caveats, approaches you tried that didn't work, or anything else._</sup>
-
+<!-- Optional. Add any notes on caveats, approaches you tried that didn't work, or anything else. -->
 
 
 ### Please make sure that this PR:

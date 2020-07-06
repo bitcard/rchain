@@ -1,6 +1,6 @@
 # RChain
 
-[![Build Status](https://drone.rchain-dev.tk/api/badges/rchain/rchain/status.svg)](https://drone.rchain-dev.tk/rchain/rchain)
+[![Build Status](https://github.com/rchain/rchain/workflows/CI/badge.svg)](https://github.com/rchain/rchain/actions?query=workflow%3ACI+branch%3Astaging)
 [![codecov](https://codecov.io/gh/rchain/rchain/branch/master/graph/badge.svg)](https://codecov.io/gh/rchain/rchain)
 
 The open-source RChain project is building a decentralized, economic,
@@ -140,6 +140,7 @@ rnode {
     port = 40400
     port-http = 40403
     port-kademlia = 40404
+    port-admin-http = 40405
     send-timeout = 2 seconds
     standalone = false
     bootstrap = "rnode://de6eed5d00cf080fc587eeb412cb31a75fd10358@52.119.8.109?protocol=40400&discovery=40404"

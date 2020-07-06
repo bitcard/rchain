@@ -11,10 +11,20 @@ import org.scalatest._
 import coop.rchain.crypto.codec._
 import coop.rchain.crypto.signatures.Signed
 import coop.rchain.node.NodeRuntime
-import coop.rchain.casper.protocol.{BlockInfo, BondInfo, DeployData, DeployInfo, LightBlockInfo}
+import coop.rchain.casper.protocol.{
+  BlockInfo,
+  BondInfo,
+  DeployData,
+  DeployInfo,
+  JustificationInfo,
+  LightBlockInfo
+}
 import coop.rchain.node.NodeRuntime.TaskEnv
 import coop.rchain.node.api.WebApi
 import coop.rchain.node.api.WebApi._
+import coop.rchain.shared.Log
+import coop.rchain.node.api.AdminWebApi
+import coop.rchain.node.api.AdminWebApi._
 import io.circe.Decoder.Result
 import monix.eval.Task
 import monix.execution.Scheduler.Implicits.global
@@ -148,13 +158,22 @@ class WebApiRoutesTest extends FlatSpec with Matchers {
       Task.delay(lightBlock).toReaderT
 
     // TODO: https://rchain.atlassian.net/browse/RCHAIN-4018
-    override def exploratoryDeploy(term: String): TaskEnv[ExploratoryDeployResponse] = ???
+    override def exploratoryDeploy(
+        term: String,
+        blockHash: Option[String],
+        usePreStateHash: Boolean
+    ): TaskEnv[ExploratoryDeployResponse] = ???
+
     override def getBlocksByHeights(
         startBlockNumber: Long,
         endBlockNumber: Long
     ): TaskEnv[List[LightBlockInfo]] = ???
 
     override def isFinalized(hash: String): TaskEnv[Boolean] = ???
+  }
+
+  def genAdminWebApi: AdminWebApi[TaskEnv] = new AdminWebApi[TaskEnv] {
+    override def propose: TaskEnv[String] = Task.delay("").toReaderT
   }
 
   implicit val decodeByteString: Decoder[ByteString] = new Decoder[ByteString] {
@@ -168,7 +187,9 @@ class WebApiRoutesTest extends FlatSpec with Matchers {
         )
       else Left(DecodingFailure("error", List[CursorOp]()))
   }
-  implicit val decodeBondInfo: Decoder[BondInfo]                 = deriveDecoder[BondInfo]
+  implicit val decodeBondInfo: Decoder[BondInfo] = deriveDecoder[BondInfo]
+  implicit val decodeJustificationInfo: Decoder[JustificationInfo] =
+    deriveDecoder[JustificationInfo]
   implicit val decodeLightBlockInfo: Decoder[LightBlockInfo]     = deriveDecoder[LightBlockInfo]
   implicit val decodeDeployInfo: Decoder[DeployInfo]             = deriveDecoder[DeployInfo]
   implicit val decodeBlockInfo: Decoder[BlockInfo]               = deriveDecoder[BlockInfo]
@@ -180,9 +201,13 @@ class WebApiRoutesTest extends FlatSpec with Matchers {
   implicit val decodePrepareResponse: Decoder[PrepareResponse]   = deriveDecoder[PrepareResponse]
   implicit val encodePrepareRequest: Encoder[PrepareRequest]     = deriveEncoder[PrepareRequest]
   implicit val et                                                = NodeRuntime.envToTask
+  implicit val log                                               = new Log.NOPLog[Task]
 
   val api   = genWebApi
   val route = WebApiRoutes.service[Task, TaskEnv](api)
+
+  val adminApi   = genAdminWebApi
+  val adminRoute = AdminWebApiRoutes.service[Task, TaskEnv](adminApi)
 
   "GET getBlock" should "detailed block info" in {
     val resp     = route.run(Request[Task](method = Method.GET, uri = Uri(path = "block/" + blockHash)))
@@ -326,6 +351,18 @@ class WebApiRoutesTest extends FlatSpec with Matchers {
     for {
       res <- act_resp
       _   = res.status should be(Status.BadRequest)
+    } yield ()
+  }
+
+  "POST propose" should "return 200" in {
+    val resp =
+      adminRoute.run(
+        Request[Task](method = Method.POST, uri = Uri(path = "propose"))
+      )
+    val act_resp = resp.value.runSyncUnsafe()
+    for {
+      res <- act_resp
+      _   = res.status should be(Status.Ok)
     } yield ()
   }
 }
