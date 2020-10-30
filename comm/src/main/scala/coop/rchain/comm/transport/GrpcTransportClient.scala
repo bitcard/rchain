@@ -3,11 +3,12 @@ package coop.rchain.comm.transport
 import java.io.ByteArrayInputStream
 import java.nio.file.Path
 
+import cats.Applicative
+import cats.effect.concurrent.{Deferred, Ref}
+
 import scala.concurrent.duration.{FiniteDuration, _}
 import scala.util._
-
 import cats.implicits._
-
 import coop.rchain.catscontrib.ski.kp
 import coop.rchain.comm._
 import coop.rchain.comm.protocol.routing._
@@ -16,13 +17,24 @@ import coop.rchain.grpc.implicits._
 import coop.rchain.metrics.Metrics
 import coop.rchain.shared.{Log, UncaughtExceptionLogger}
 import coop.rchain.shared.PathOps.PathDelete
-
 import io.grpc.ManagedChannel
 import io.grpc.netty._
 import io.netty.handler.ssl.SslContext
 import monix.eval.Task
-import monix.execution.Scheduler
+import monix.execution.Ack.Continue
+import monix.execution.{Cancelable, CancelableFuture, Scheduler}
 import monix.reactive.Observable
+
+/**
+  * GRPC channel with a message buffer protecting it from resource exhaustion
+  * @param grpcTransport underlying gRPC channel
+  * @param buffer buffer implementing some kind of overflow policy
+  */
+final case class BufferedGrpcStreamChannel(
+    grpcTransport: ManagedChannel,
+    buffer: StreamObservable,
+    buferSubscriber: Cancelable
+)
 
 class GrpcTransportClient(
     networkId: String,
@@ -31,7 +43,8 @@ class GrpcTransportClient(
     maxMessageSize: Int,
     packetChunkSize: Int,
     tempFolder: Path,
-    clientQueueSize: Int
+    clientQueueSize: Int,
+    channelsMap: Ref[Task, Map[PeerNode, Deferred[Task, BufferedGrpcStreamChannel]]]
 )(
     implicit scheduler: Scheduler,
     val log: Log[Task],
@@ -43,25 +56,8 @@ class GrpcTransportClient(
   implicit val metricsSource: Metrics.Source =
     Metrics.Source(CommMetricsSource, "rp.transport")
 
-  private def certInputStream  = new ByteArrayInputStream(cert.getBytes())
-  private def keyInputStream   = new ByteArrayInputStream(key.getBytes())
-  private val streamObservable = new StreamObservable(clientQueueSize, tempFolder)
-  private val parallelism      = Math.max(Runtime.getRuntime.availableProcessors(), 2)
-  private val streamQueue =
-    streamObservable
-      .flatMap { s =>
-        Observable
-          .fromIterable(s.peers)
-          .mapParallelUnordered(parallelism)(
-            streamBlobFile(s.path, _, s.sender)
-          )
-          .guarantee(s.path.deleteSingleFile[Task]())
-      }
-
-  // Start to consume the stream queue immediately
-  private val _ = streamQueue.subscribe()(
-    Scheduler.fixedPool("tl-client-stream-queue", parallelism, reporter = UncaughtExceptionLogger)
-  )
+  private def certInputStream = new ByteArrayInputStream(cert.getBytes())
+  private def keyInputStream  = new ByteArrayInputStream(key.getBytes())
 
   private val clientSslContextTask: Task[SslContext] =
     Task
@@ -77,47 +73,77 @@ class GrpcTransportClient(
         case Left(t)           => Task.raiseError[SslContext](t)
       }
 
-  private def clientChannel(peer: PeerNode): Task[ManagedChannel] =
+  private def createChannel(peer: PeerNode): Task[BufferedGrpcStreamChannel] =
     for {
+      _                <- log.info(s"Creating new channel to peer ${peer.toAddress}")
       clientSslContext <- clientSslContextTask
-      c <- Task.delay {
-            NettyChannelBuilder
-              .forAddress(peer.endpoint.host, peer.endpoint.tcpPort)
-              .executor(scheduler)
-              .maxInboundMessageSize(maxMessageSize)
-              .negotiationType(NegotiationType.TLS)
-              .sslContext(clientSslContext)
-              .intercept(new SslSessionClientInterceptor(networkId))
-              .overrideAuthority(peer.id.toString)
-              .build()
-          }
-    } yield c
+      grpcChannel = NettyChannelBuilder
+        .forAddress(peer.endpoint.host, peer.endpoint.tcpPort)
+        .executor(scheduler)
+        .maxInboundMessageSize(maxMessageSize)
+        .negotiationType(NegotiationType.TLS)
+        .sslContext(clientSslContext)
+        .intercept(new SslSessionClientInterceptor(networkId))
+        .overrideAuthority(peer.id.toString)
+        .build()
+      buffer = new StreamObservable(peer, clientQueueSize, tempFolder)
 
-  def disconnect(peer: PeerNode): Task[Unit] = Task.unit
+      buferSubscriber = buffer.subscribe(
+        sMsg =>
+          streamBlobFile(sMsg.path, peer, sMsg.sender)
+            .guarantee(sMsg.path.deleteSingleFile[Task])
+            .runToFuture >> Continue.pure[CancelableFuture]
+      )
+
+      channel = BufferedGrpcStreamChannel(grpcChannel, buffer, buferSubscriber)
+    } yield channel
+
+  private def getChannel(peer: PeerNode): Task[BufferedGrpcStreamChannel] =
+    for {
+      cDefNew <- Deferred[Task, BufferedGrpcStreamChannel]
+      ret <- channelsMap.modify[(Deferred[Task, BufferedGrpcStreamChannel], Boolean)] { chMap =>
+              val noCh = !chMap.exists(c => c._1 equals peer)
+              if (noCh) {
+                (chMap + (peer -> cDefNew), (cDefNew, true))
+              } else {
+                (chMap, (chMap(peer), false))
+              }
+            }
+      (cDef, newChannel) = ret
+      _                  <- Applicative[Task].whenA(newChannel)(createChannel(peer) >>= cDef.complete)
+      c                  <- cDef.get
+      // In case underlying gRPC transport is terminated - clean resources,
+      // remove current record and try one more time
+      r <- if (c.grpcTransport.isTerminated)
+            Task.delay(c.buferSubscriber.cancel()) >>
+              log.info(
+                s"Channel to peer ${peer.toAddress} is terminated, removing from connections map"
+              ) >>
+              channelsMap.update(_ - peer) >> getChannel(peer)
+          else c.pure[Task]
+    } yield r
 
   private def withClient[A](peer: PeerNode, timeout: FiniteDuration)(
       request: GrpcTransport.Request[A]
   ): Task[CommErr[A]] =
     (for {
-      //_       <- log.debug(s"Creating new channel to peer ${peer.toAddress}")
-      channel <- clientChannel(peer)
-      stub    <- Task.delay(RoutingGrpcMonix.stub(channel).withDeadlineAfter(timeout))
-      result  <- request(stub).doOnFinish(kp(Task.delay(channel.shutdown()).attempt.void))
-      //_       <- log.debug(s"Send request to peer ${peer.toAddress} done")
-      _ <- Task.unit.asyncBoundary // return control to caller thread
+      channel <- getChannel(peer)
+      stub    <- Task.delay(RoutingGrpcMonix.stub(channel.grpcTransport).withDeadlineAfter(timeout))
+      result  <- request(stub)
+      _       <- Task.unit.asyncBoundary // return control to caller thread
     } yield result).attempt.map(_.fold(e => Left(protocolException(e)), identity))
 
   def send(peer: PeerNode, msg: Protocol): Task[CommErr[Unit]] =
     withClient(peer, DefaultSendTimeout)(GrpcTransport.send(peer, msg))
 
   def broadcast(peers: Seq[PeerNode], msg: Protocol): Task[Seq[CommErr[Unit]]] =
-    Task.gatherUnordered(peers.map(send(_, msg)))
+    Task.parSequenceUnordered(peers.map(send(_, msg)))
 
   def stream(peer: PeerNode, blob: Blob): Task[Unit] =
-    stream(Seq(peer), blob)
+    getChannel(peer).flatMap(_.buffer.enque(blob))
 
   def stream(peers: Seq[PeerNode], blob: Blob): Task[Unit] =
-    streamObservable.stream(peers, blob)
+    Task.parSequenceUnordered(peers.map(stream(_, blob))).void
 
   private def streamBlobFile(
       path: Path,
@@ -130,18 +156,20 @@ class GrpcTransportClient(
 
     PacketOps.restore[Task](path) >>= {
       case Right(packet) =>
-        withClient(peer, timeout(packet))(
-          GrpcTransport.stream(networkId, peer, Blob(sender, packet), packetChunkSize)
-        ).flatMap {
-          case Left(error) =>
-            log.debug(
-              s"Error while streaming packet to $peer (timeout: ${timeout(packet).toMillis}ms): ${error.message}"
-            )
-          case Right(_) => log.debug(s"Streamed packet $path to $peer")
-        }
+        log.debug(
+          s"Attempting to stream packet to $peer with timeout: ${timeout(packet).toMillis}ms"
+        ) >>
+          withClient(peer, timeout(packet))(
+            GrpcTransport.stream(networkId, peer, Blob(sender, packet), packetChunkSize)
+          ).flatMap {
+            case Left(error) =>
+              log.debug(
+                s"Error while streaming packet to $peer (timeout: ${timeout(packet).toMillis}ms): ${error.message}"
+              )
+            case Right(_) => log.debug(s"Streamed packet $path to $peer")
+          }
       case Left(error) =>
         log.error(s"Error while streaming packet $path to $peer: ${error.message}")
     }
   }
-
 }

@@ -60,7 +60,7 @@ class TestNode[F[_]](
     synchronyConstraintThreshold: Double,
     maxNumberOfParents: Int = Estimator.UnlimitedParents,
     maxParentDepth: Option[Int] = None,
-    shardId: String = "rchain",
+    shardId: String = "root",
     finalizationRate: Int = 1,
     isReadOnly: Boolean = false
 )(
@@ -117,13 +117,17 @@ class TestNode[F[_]](
   implicit val commUtil: CommUtil[F]             = CommUtil.of[F]
   implicit val blockRetriever: BlockRetriever[F] = BlockRetriever.of[F]
 
+  val blockProcessingState =
+    Ref.unsafe[F, BlockProcessingState](BlockProcessingState(Set.empty, Set.empty))
+
   implicit val casperEff = new MultiParentCasperImpl[F](
     validatorId,
     genesis,
     postGenesisStateHash,
     shardId,
     finalizationRate,
-    blockProcessingLock
+    blockProcessingLock,
+    blockProcessingState
   )
 
   val engine                             = new Running(casperEff, approvedBlock, validatorId, ().pure[F])

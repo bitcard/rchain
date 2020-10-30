@@ -33,6 +33,7 @@ import coop.rchain.shared.{AtomicMonadState, Log, LogSource}
 import monix.execution.atomic.AtomicAny
 import org.lmdbjava.DbiFlags.MDB_CREATE
 import org.lmdbjava.{Env, EnvFlags}
+import org.lmdbjava.ByteBufferProxy.PROXY_SAFE
 
 import scala.ref.WeakReference
 import scala.util.matching.Regex
@@ -287,7 +288,6 @@ final class BlockDagFileStorage[F[_]: Concurrent: Sync: Log: RaiseIOError] priva
 
   def insert(
       block: BlockMessage,
-      genesis: BlockMessage,
       invalid: Boolean
   ): F[BlockDagRepresentation[F]] =
     lock.withPermit(
@@ -306,7 +306,7 @@ final class BlockDagFileStorage[F[_]: Concurrent: Sync: Log: RaiseIOError] priva
                   .map(_.validator)
                   .toSet
                   .diff(block.justifications.map(_.validator).toSet)
-                newValidatorsLatestMessages = newValidators.map(v => (v, genesis.blockHash))
+                newValidatorsLatestMessages = newValidators.map(v => (v, block.blockHash))
                 newValidatorsWithSenderLatestMessages <- if (block.sender.isEmpty) {
                                                           // Ignore empty sender for special cases such as genesis block
                                                           Log[F].warn(
@@ -442,7 +442,7 @@ object BlockDagFileStorage {
       env <- Sync[F].delay {
               val flags = if (config.noTls) List(EnvFlags.MDB_NOTLS) else List.empty
               Env
-                .create()
+                .create(PROXY_SAFE)
                 .setMapSize(config.mapSize)
                 .setMaxDbs(config.maxDbs)
                 .setMaxReaders(config.maxReaders)

@@ -33,7 +33,9 @@ object Running {
   trait CasperMessageStatus
   final case object BlockIsInDag            extends CasperMessageStatus
   final case object BlockIsInCasperBuffer   extends CasperMessageStatus
+  final case object BlockIsReceived         extends CasperMessageStatus
   final case object BlockIsWaitingForCasper extends CasperMessageStatus
+  final case object BlockIsInProcessing     extends CasperMessageStatus
   final case object DoNotIgnore             extends CasperMessageStatus
 
   final case class IgnoreCasperMessageStatus(doIgnore: Boolean, status: CasperMessageStatus)
@@ -163,7 +165,7 @@ object Running {
       if (r.doIgnore) {
         logIgnore(r.status)
       } else {
-        logSuccess >> processHash
+        logSuccess >> processHash.void
       }
     })
   }
@@ -191,7 +193,7 @@ object Running {
       if (r.doIgnore) {
         logIgnore(r.status)
       } else {
-        logProcess >> processHash
+        logProcess >> processHash.void
       }
     })
   }
@@ -281,32 +283,48 @@ class Running[F[_]: Concurrent: BlockStore: CasperBufferStorage: BlockRetriever:
   /**
     * Message that relates to a block A (e.g. block message or block hash broadcast message) shall be considered
     * as repeated and ignored if block A is
-    * 1. marked as received in BlocksRetriever and pending adding to CasperBuffer or
-    * 2. added do CasperBuffer and pending adding to DAG or
-    * 3. already added to DAG.
+    * 1. BlockIsInProcessing      -> currently replayed by Casper
+    * 2. BlockIsWaitingForCasper  -> ready to be replayed but Casper is busy, so processing is postponed
+    * 3. BlockIsInCasperBuffer    -> is missing dependencies so added to CasperBuffer
+    *                                and waiting for all dependencies to be filled
+    * 4. BlockIsInDag             -> is already added to the DAG.
+    * 5. BlockIsReceived          -> is received, but BlockRetriever did not process it yet (rare case).
     * Otherwise - that is a new message and shall be processed normal way.
     *
     * @param hash Block hash
     * @return If message should be ignored
     */
   private def ignoreCasperMessage(hash: BlockHash): F[IgnoreCasperMessageStatus] =
-    BlockRetriever[F]
-      .received(hash)
-      .ifM(
-        IgnoreCasperMessageStatus(doIgnore = true, BlockIsWaitingForCasper).pure[F],
-        CasperBufferStorage[F]
-          .contains(hash)
-          .ifM(
-            IgnoreCasperMessageStatus(doIgnore = true, BlockIsInCasperBuffer).pure[F],
-            casper.blockDag.flatMap(
-              _.contains(hash)
-                .ifM(
-                  IgnoreCasperMessageStatus(doIgnore = true, BlockIsInDag).pure[F],
-                  IgnoreCasperMessageStatus(doIgnore = false, DoNotIgnore).pure[F]
+    for {
+      // This long chain of ifM created to minimise computation for ignore check and provide
+      // readable output for each ignore reason
+      received  <- BlockRetriever[F].isReceived(hash)
+      casperBPS <- casper.getBlockProcessingState
+      r <- if (casperBPS.processing.contains(hash))
+            IgnoreCasperMessageStatus(doIgnore = true, BlockIsInProcessing).pure[F]
+          else if (casperBPS.enqueued.contains(hash))
+            IgnoreCasperMessageStatus(doIgnore = true, BlockIsWaitingForCasper).pure[F]
+          else
+            CasperBufferStorage[F]
+              .contains(hash)
+              .ifM(
+                IgnoreCasperMessageStatus(doIgnore = true, BlockIsInCasperBuffer).pure[F],
+                casper.blockDag.flatMap(
+                  _.contains(hash)
+                    .ifM(
+                      IgnoreCasperMessageStatus(doIgnore = true, BlockIsInDag).pure[F],
+                      // If none of the checks above is true, this means that
+                      // thread that received block did not execute Casper code yet.
+                      // So there is still possibility of `received` to be true, that's why
+                      // this check put in place. But the possibility is close to 0.
+                      if (received)
+                        IgnoreCasperMessageStatus(doIgnore = true, BlockIsReceived).pure[F]
+                      else
+                        IgnoreCasperMessageStatus(doIgnore = false, DoNotIgnore).pure[F]
+                    )
                 )
-            )
-          )
-      )
+              )
+    } yield r
 
   /**
     * Basic block validation before saving block in Blockstore. The intention here is to prevent saving

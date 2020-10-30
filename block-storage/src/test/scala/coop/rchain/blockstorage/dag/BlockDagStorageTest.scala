@@ -39,20 +39,13 @@ trait BlockDagStorageTest
 
   def withDagStorage[R](f: BlockDagStorage[Task] => Task[R]): R
 
-  val genesis = BlockMessage
-    .from(
-      BlockMessageProto()
-        .withHeader(HeaderProto())
-        .withBody(BodyProto().withState(RChainStateProto()))
-    )
-    .right
-    .get
+  val genesis = getRandomBlock(setBonds = Some(List.empty))
 
   "DAG Storage" should "be able to lookup a stored block" in {
-    forAll(blockElementsWithParentsGen, minSize(0), sizeRange(10)) { blockElements =>
+    forAll(blockElementsWithParentsGen(genesis), minSize(0), sizeRange(10)) { blockElements =>
       withDagStorage { dagStorage =>
         for {
-          _   <- blockElements.traverse_(dagStorage.insert(_, genesis, false))
+          _   <- blockElements.traverse_(dagStorage.insert(_, false))
           dag <- dagStorage.getRepresentation
           blockElementLookups <- blockElements.traverse { b =>
                                   for {
@@ -71,7 +64,7 @@ trait BlockDagStorageTest
           }
           _      = latestMessageHashes.size shouldBe blockElements.size
           result = latestMessages.size shouldBe blockElements.size
-        } yield result
+        } yield ()
       }
     }
   }
@@ -268,11 +261,11 @@ class BlockDagFileStorageTest extends BlockDagStorageTest {
   }
 
   it should "be able to restore state on startup" in {
-    forAll(blockElementsWithParentsGen, minSize(0), sizeRange(10)) { blockElements =>
+    forAll(blockElementsWithParentsGen(genesis), minSize(0), sizeRange(10)) { blockElements =>
       withDagStorageLocation { dagDataDir =>
         for {
           firstStorage  <- createAtDefaultLocation(dagDataDir)
-          _             <- blockElements.traverse_(firstStorage.insert(_, genesis, false))
+          _             <- blockElements.traverse_(firstStorage.insert(_, false))
           _             <- firstStorage.close()
           secondStorage <- createAtDefaultLocation(dagDataDir)
           result        <- lookupElements(blockElements, secondStorage)
@@ -283,7 +276,7 @@ class BlockDagFileStorageTest extends BlockDagStorageTest {
   }
 
   it should "be able to restore latest messages with genesis with empty sender field" in {
-    forAll(blockElementsWithParentsGen, minSize(0), sizeRange(10)) { blockElements =>
+    forAll(blockElementsWithParentsGen(genesis), minSize(0), sizeRange(10)) { blockElements =>
       val blockElementsWithGenesis = blockElements match {
         case x :: xs =>
           val genesis = x.copy(sender = ByteString.EMPTY)
@@ -294,7 +287,7 @@ class BlockDagFileStorageTest extends BlockDagStorageTest {
       withDagStorageLocation { dagDataDir =>
         for {
           firstStorage  <- createAtDefaultLocation(dagDataDir)
-          _             <- blockElementsWithGenesis.traverse_(firstStorage.insert(_, genesis, false))
+          _             <- blockElementsWithGenesis.traverse_(firstStorage.insert(_, false))
           _             <- firstStorage.close()
           secondStorage <- createAtDefaultLocation(dagDataDir)
           result        <- lookupElements(blockElementsWithGenesis, secondStorage)
@@ -305,31 +298,32 @@ class BlockDagFileStorageTest extends BlockDagStorageTest {
   }
 
   it should "be able to restore state from the previous two instances" in {
-    forAll(blockElementsWithParentsGen, minSize(0), sizeRange(10)) { firstBlockElements =>
-      forAll(blockElementsWithParentsGen, minSize(0), sizeRange(10)) { secondBlockElements =>
-        withDagStorageLocation { dagDataDir =>
-          for {
-            firstStorage  <- createAtDefaultLocation(dagDataDir)
-            _             <- firstBlockElements.traverse_(firstStorage.insert(_, genesis, false))
-            _             <- firstStorage.close()
-            secondStorage <- createAtDefaultLocation(dagDataDir)
-            _             <- secondBlockElements.traverse_(secondStorage.insert(_, genesis, false))
-            _             <- secondStorage.close()
-            thirdStorage  <- createAtDefaultLocation(dagDataDir)
-            result        <- lookupElements(firstBlockElements ++ secondBlockElements, thirdStorage)
-            _             <- thirdStorage.close()
-          } yield testLookupElementsResult(result, firstBlockElements ++ secondBlockElements)
-        }
+    forAll(blockElementsWithParentsGen(genesis), minSize(0), sizeRange(10)) { firstBlockElements =>
+      forAll(blockElementsWithParentsGen(genesis), minSize(0), sizeRange(10)) {
+        secondBlockElements =>
+          withDagStorageLocation { dagDataDir =>
+            for {
+              firstStorage  <- createAtDefaultLocation(dagDataDir)
+              _             <- firstBlockElements.traverse_(firstStorage.insert(_, false))
+              _             <- firstStorage.close()
+              secondStorage <- createAtDefaultLocation(dagDataDir)
+              _             <- secondBlockElements.traverse_(secondStorage.insert(_, false))
+              _             <- secondStorage.close()
+              thirdStorage  <- createAtDefaultLocation(dagDataDir)
+              result        <- lookupElements(firstBlockElements ++ secondBlockElements, thirdStorage)
+              _             <- thirdStorage.close()
+            } yield testLookupElementsResult(result, firstBlockElements ++ secondBlockElements)
+          }
       }
     }
   }
 
   it should "be able to restore latest messages on startup with appended 64 garbage bytes" in {
-    forAll(blockElementsWithParentsGen, minSize(0), sizeRange(10)) { blockElements =>
+    forAll(blockElementsWithParentsGen(genesis), minSize(0), sizeRange(10)) { blockElements =>
       withDagStorageLocation { dagDataDir =>
         for {
           firstStorage <- createAtDefaultLocation(dagDataDir)
-          _            <- blockElements.traverse_(firstStorage.insert(_, genesis, false))
+          _            <- blockElements.traverse_(firstStorage.insert(_, false))
           _            <- firstStorage.close()
           garbageBytes = Array.fill[Byte](Validator.Length + BlockHash.Length)(0)
           _            <- Sync[Task].delay { Random.nextBytes(garbageBytes) }
@@ -349,12 +343,12 @@ class BlockDagFileStorageTest extends BlockDagStorageTest {
   }
 
   it should "be able to restore data lookup on startup with appended garbage block metadata" in {
-    forAll(blockElementsWithParentsGen, blockElementGen, minSize(0), sizeRange(10)) {
+    forAll(blockElementsWithParentsGen(genesis), blockElementGen(), minSize(0), sizeRange(10)) {
       (blockElements, garbageBlock) =>
         withDagStorageLocation { dagDataDir =>
           for {
             firstStorage                  <- createAtDefaultLocation(dagDataDir)
-            _                             <- blockElements.traverse_(firstStorage.insert(_, genesis, invalid = false))
+            _                             <- blockElements.traverse_(firstStorage.insert(_, invalid = false))
             _                             <- firstStorage.close()
             garbageBlockMetadata          = BlockMetadata.fromBlock(garbageBlock, invalid = false)
             keyValueCodec                 = (codecBlockHash ~ codecBlockMetadata)
@@ -387,15 +381,15 @@ class BlockDagFileStorageTest extends BlockDagStorageTest {
   }
 
   it should "be able to restore after squashing latest messages" in {
-    forAll(blockElementsWithParentsGen, minSize(0), sizeRange(10)) { blockElements =>
+    forAll(blockElementsWithParentsGen(genesis), minSize(0), sizeRange(10)) { blockElements =>
       forAll(blockWithNewHashesGen(blockElements), blockWithNewHashesGen(blockElements)) {
         (secondBlockElements, thirdBlockElements) =>
           withDagStorageLocation { dagDataDir =>
             for {
               firstStorage  <- createAtDefaultLocation(dagDataDir, 2)
-              _             <- blockElements.traverse_(firstStorage.insert(_, genesis, false))
-              _             <- secondBlockElements.traverse_(firstStorage.insert(_, genesis, false))
-              _             <- thirdBlockElements.traverse_(firstStorage.insert(_, genesis, false))
+              _             <- blockElements.traverse_(firstStorage.insert(_, false))
+              _             <- secondBlockElements.traverse_(firstStorage.insert(_, false))
+              _             <- thirdBlockElements.traverse_(firstStorage.insert(_, false))
               _             <- firstStorage.close()
               secondStorage <- createAtDefaultLocation(dagDataDir)
               result        <- lookupElements(blockElements, secondStorage)
@@ -410,13 +404,13 @@ class BlockDagFileStorageTest extends BlockDagStorageTest {
   }
 
   it should "be able to restore equivocations tracker on startup" in {
-    forAll(blockElementsWithParentsGen, minSize(0), sizeRange(10)) { blockElements =>
+    forAll(blockElementsWithParentsGen(genesis), minSize(0), sizeRange(10)) { blockElements =>
       forAll(validatorGen) { equivocator =>
         forAll(blockHashGen) { blockHash =>
           withDagStorageLocation { dagDataDir =>
             for {
               firstStorage <- createAtDefaultLocation(dagDataDir)
-              _            <- blockElements.traverse_(firstStorage.insert(_, genesis, false))
+              _            <- blockElements.traverse_(firstStorage.insert(_, false))
               record = EquivocationRecord(
                 equivocator,
                 0,
@@ -462,13 +456,13 @@ class BlockDagFileStorageTest extends BlockDagStorageTest {
   }
 
   it should "be able to restore equivocations tracker on startup with appended garbage equivocation record" in {
-    forAll(blockElementsWithParentsGen, minSize(0), sizeRange(10)) { blockElements =>
+    forAll(blockElementsWithParentsGen(genesis), minSize(0), sizeRange(10)) { blockElements =>
       forAll(validatorGen) { equivocator =>
         forAll(blockHashGen) { blockHash =>
           withDagStorageLocation { dagDataDir =>
             for {
               firstStorage <- createAtDefaultLocation(dagDataDir)
-              _            <- blockElements.traverse_(firstStorage.insert(_, genesis, false))
+              _            <- blockElements.traverse_(firstStorage.insert(_, false))
               record = EquivocationRecord(
                 equivocator,
                 0,
@@ -514,11 +508,11 @@ class BlockDagFileStorageTest extends BlockDagStorageTest {
   }
 
   it should "be able to restore invalid blocks on startup" in {
-    forAll(blockElementsWithParentsGen, minSize(0), sizeRange(10)) { blockElements =>
+    forAll(blockElementsWithParentsGen(genesis), minSize(0), sizeRange(10)) { blockElements =>
       withDagStorageLocation { dagDataDir =>
         for {
           firstStorage  <- createAtDefaultLocation(dagDataDir)
-          _             <- blockElements.traverse_(firstStorage.insert(_, genesis, true))
+          _             <- blockElements.traverse_(firstStorage.insert(_, true))
           _             <- firstStorage.close()
           secondStorage <- createAtDefaultLocation(dagDataDir)
           dag           <- secondStorage.getRepresentation
@@ -530,11 +524,11 @@ class BlockDagFileStorageTest extends BlockDagStorageTest {
   }
 
   it should "be able to restore deploy index on startup" in {
-    forAll(blockElementsWithParentsGen, minSize(0), sizeRange(10)) { blockElements =>
+    forAll(blockElementsWithParentsGen(genesis), minSize(0), sizeRange(10)) { blockElements =>
       withDagStorageLocation { dagDataDir =>
         for {
           firstStorage  <- createAtDefaultLocation(dagDataDir)
-          _             <- blockElements.traverse_(firstStorage.insert(_, genesis, true))
+          _             <- blockElements.traverse_(firstStorage.insert(_, true))
           _             <- firstStorage.close()
           secondStorage <- createAtDefaultLocation(dagDataDir)
           dag           <- secondStorage.getRepresentation
@@ -549,12 +543,12 @@ class BlockDagFileStorageTest extends BlockDagStorageTest {
   }
 
   it should "be able to load checkpoints" in {
-    forAll(blockElementsWithParentsGen, minSize(1), sizeRange(2)) { blockElements =>
+    forAll(blockElementsWithParentsGen(genesis), minSize(1), sizeRange(2)) { blockElements =>
       withDagStorageLocation { dagDataDir =>
         for {
           firstStorage <- createAtDefaultLocation(dagDataDir)
           _ <- blockElements.traverse_(
-                b => firstStorage.insert(b, genesis, false)
+                b => firstStorage.insert(b, false)
               )
           _ <- firstStorage.close()
           _ <- Sync[Task].delay {
@@ -576,12 +570,12 @@ class BlockDagFileStorageTest extends BlockDagStorageTest {
   }
 
   it should "handle blocks with invalid numbers" in {
-    forAll(blockElementGen, blockElementGen) { (genesis, block) =>
+    forAll(blockElementGen(), blockElementGen()) { (genesis, block) =>
       withDagStorage { dagStorage =>
         val invalidBlock =
           block.copy(body = block.body.copy(state = block.body.state.copy(blockNumber = 1000)))
-        dagStorage.insert(genesis, genesis, false) >>
-          dagStorage.insert(invalidBlock, genesis, true)
+        dagStorage.insert(genesis, false) >>
+          dagStorage.insert(invalidBlock, true)
       }
     }
   }

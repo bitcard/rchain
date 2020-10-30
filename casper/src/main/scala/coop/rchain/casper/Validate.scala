@@ -458,15 +458,7 @@ object Validate {
 
   // TODO: Double check this validation isn't shadowed by the blockSignature validation
   def blockHash[F[_]: Applicative: Log](b: BlockMessage): F[ValidBlockProcessing] = {
-    val blockHashComputed = ProtoUtil.hashSignedBlock(
-      b.header,
-      b.body,
-      b.sender,
-      b.sigAlgorithm,
-      b.seqNum,
-      b.shardId,
-      b.extraBytes
-    )
+    val blockHashComputed = ProtoUtil.hashSignedBlock(b)
     if (b.blockHash == blockHashComputed)
       BlockStatus.valid.asRight[BlockError].pure
     else {
@@ -704,7 +696,7 @@ object Validate {
       case Left(ex: Throwable) =>
         for {
           _ <- Log[F].warn(s"Failed to compute bonds from tuplespace hash ${ex.getMessage}")
-        } yield BlockStatus.invalidBondsCache.asLeft[ValidBlock]
+        } yield BlockError.BlockException(ex).asLeft[ValidBlock]
     }
   }
 }

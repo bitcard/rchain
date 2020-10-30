@@ -35,7 +35,7 @@ trait BlockRetriever[F[_]] {
       hash: BlockHash,
       peer: Option[PeerNode] = None,
       admitHashReason: BlockRetriever.AdmitHashReason
-  ): F[Unit]
+  ): F[BlockRetriever.AdmitHashResult]
 
   /**
     * Try to request all pending hashes
@@ -50,10 +50,7 @@ trait BlockRetriever[F[_]] {
   def ackInCasper(hash: BlockHash): F[Unit]
 
   /** If block is received and waiting for Casper to add it */
-  def received(hash: BlockHash): F[Boolean]
-
-  /** Blocks that are received but still not in Casper*/
-  def getEnqueuedToCasper: F[List[BlockHash]]
+  def isReceived(hash: BlockHash): F[Boolean]
 }
 
 object BlockRetriever {
@@ -64,8 +61,16 @@ object BlockRetriever {
   final case object MissingDependencyRequested extends AdmitHashReason
   final case object BlockReceived              extends AdmitHashReason
 
-  implicit private[this] val BlockRequesterMetricsSource: Source =
-    Metrics.Source(CasperMetricsSource, "blocks-retriever")
+  trait AdmitHashStatus
+  final object NewSourcePeerAddedToRequest extends AdmitHashStatus
+  final object NewRequestAdded             extends AdmitHashStatus
+  final object Ignore                      extends AdmitHashStatus
+
+  final case class AdmitHashResult(
+      status: AdmitHashStatus,
+      broadcastRequest: Boolean,
+      requestBlock: Boolean
+  )
 
   final case class RequestState(
       // Last time block was requested
@@ -130,21 +135,10 @@ object BlockRetriever {
               received = markAsReceived
             ))
 
-      trait AdmitHashStatus
-      final object NewSourcePeerAddedToRequest extends AdmitHashStatus
-      final object NewRequestAdded             extends AdmitHashStatus
-      final object Ignore                      extends AdmitHashStatus
-
-      case class AdmitHashResult(
-          status: AdmitHashStatus,
-          broadcastRequest: Boolean,
-          requestBlock: Boolean
-      )
-
       /**
-        * @param hash - block hash node encountered
-        * @param peer - peer that node received message with hash from, None hash admit is triggered by some internal
-        *             process, not as a result of external message
+        * @param hash            - block hash node encountered
+        * @param peer            - peer that node received message with hash from, None hash admit is triggered by some internal
+        *                        process, not as a result of external message
         * @param admitHashReason - source of hash info, for logging purposes
         * @return
         */
@@ -152,7 +146,7 @@ object BlockRetriever {
           hash: BlockHash,
           peer: Option[PeerNode],
           admitHashReason: AdmitHashReason
-      ): F[Unit] =
+      ): F[AdmitHashResult] =
         for {
           now <- Time[F].currentMillis
           result <- RequestedBlocks[F]
@@ -171,14 +165,27 @@ object BlockRetriever {
                          // peer is provided - add it to waiting list
                          if (peer.nonEmpty)
                            (
-                             addSourcePeerToRequest(state, hash, peer.get),
-                             AdmitHashResult(
-                               NewSourcePeerAddedToRequest,
-                               broadcastRequest = false,
-                               // if peer is the first one in waiting list - request block from that peer,
-                               // otherwise requests should be triggered by casper loop
-                               requestBlock = if (state(hash).waitingList.isEmpty) true else false
-                             )
+                             if (state(hash).waitingList.contains(peer.get))
+                               (
+                                 state,
+                                 AdmitHashResult(
+                                   Ignore,
+                                   broadcastRequest = false,
+                                   requestBlock = false
+                                 )
+                               )
+                             else {
+                               (
+                                 addSourcePeerToRequest(state, hash, peer.get),
+                                 AdmitHashResult(
+                                   NewSourcePeerAddedToRequest,
+                                   broadcastRequest = false,
+                                   // if peer is the first one in waiting list - request block from that peer,
+                                   // otherwise requests should be triggered by casper loop
+                                   requestBlock = state(hash).waitingList.isEmpty
+                                 )
+                               )
+                             }
                            )
                          // otherwise ignore, no new information to add
                          else
@@ -207,10 +214,12 @@ object BlockRetriever {
               else ().pure[F]
           _ <- if (result.requestBlock) CommUtil[F].requestForBlock(peer.get, hash)
               else ().pure[F]
-        } yield ()
+        } yield result
 
       trait AckReceiveResult
-      final case object AddedAsReceived  extends AckReceiveResult
+
+      final case object AddedAsReceived extends AckReceiveResult
+
       final case object MarkedAsReceived extends AckReceiveResult
 
       override def ackReceive(
@@ -244,14 +253,14 @@ object BlockRetriever {
 
       override def ackInCasper(hash: BlockHash): F[Unit] =
         for {
-          r <- received(hash)
+          r <- isReceived(hash)
           _ <- ackReceive(hash).unlessA(r)
           _ <- RequestedBlocks[F].update { state =>
                 state + (hash -> state(hash).copy(inCasperBuffer = true))
               }
         } yield ()
 
-      override def received(hash: BlockHash): F[Boolean] =
+      override def isReceived(hash: BlockHash): F[Boolean] =
         RequestedBlocks.get(hash).map(x => x.nonEmpty && x.get.received)
 
       override def requestAll(
@@ -270,7 +279,6 @@ object BlockRetriever {
                         s"Remain waiting: ${waitingListTail.map(_.endpoint.host).mkString(", ")}."
                     )
                 _  <- CommUtil[F].requestForBlock(nextPeer, hash)
-                _  <- CommUtil[F].broadcastHasBlockRequest(hash).whenA(waitingListTail.isEmpty)
                 ts <- Time[F].currentMillis
                 _ <- RequestedBlocks.put(
                       hash,
@@ -282,11 +290,14 @@ object BlockRetriever {
                     )
               } yield ()
             case _ =>
-              val warnMessage = s"Could not retrieve requested block ${PrettyPrinter.buildString(hash)} " +
-                s"from ${requested.peers.mkString(", ")}. Removing the request from the requested blocks list. " +
-                s"Casper will have to re-request the block."
-              Metrics[F].incrementCounter("block-retrieve-failed") >>
-                Log[F].warn(warnMessage)
+              for {
+                _ <- Log[F].warn(
+                      s"Could not retrieve requested block ${PrettyPrinter.buildString(hash)} " +
+                        s"from ${requested.peers.mkString(", ")}. Asking peers again."
+                    )
+                _ <- RequestedBlocks.remove(hash)
+                _ <- CommUtil[F].broadcastHasBlockRequest(hash)
+              } yield ()
           }
 
         import cats.instances.list._
@@ -316,12 +327,5 @@ object BlockRetriever {
               })
         } yield ()
       }
-
-      /** Blocks that are received but still not in Casper */
-      override def getEnqueuedToCasper: F[List[BlockHash]] =
-        for {
-          state         <- RequestedBlocks[F].get
-          waitingHashes = state.toList.filter(i => i._2.received && !i._2.inCasperBuffer).map(_._1)
-        } yield waitingHashes
     }
 }

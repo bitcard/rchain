@@ -54,7 +54,8 @@ trait WebApi[F[_]] {
 object WebApi {
 
   class WebApiImpl[F[_]: Sync: Concurrent: EngineCell: Log: Span: SafetyOracle: BlockStore](
-      apiMaxBlocksLimit: Int
+      apiMaxBlocksLimit: Int,
+      devMode: Boolean = false
   ) extends WebApi[F] {
     import WebApiSyntax._
 
@@ -104,7 +105,7 @@ object WebApi {
         usePreStateHash: Boolean
     ): F[ExploratoryDeployResponse] =
       BlockAPI
-        .exploratoryDeploy(term, blockHash, usePreStateHash)
+        .exploratoryDeploy(term, blockHash, usePreStateHash, devMode)
         .flatMap(_.liftToBlockApiErr)
         .map(toExploratoryResponse)
 
@@ -319,18 +320,6 @@ object WebApi {
     val (pars, lightBlockInfo) = data
     val rhoExprs               = pars.flatMap(exprFromParProto)
     ExploratoryDeployResponse(rhoExprs, lightBlockInfo)
-  }
-
-  object WebApiSyntax {
-    implicit final class OptionExt[A](val x: Option[A]) extends AnyVal {
-      def liftToSigErr[F[_]: Sync](error: String): F[A] =
-        x.liftTo[F](new SignatureException(error))
-    }
-
-    implicit final class EitherStringExt[A](val x: Either[String, A]) extends AnyVal {
-      def liftToBlockApiErr[F[_]: Sync]: F[A] =
-        x.leftMap(new BlockApiException(_)).liftTo[F]
-    }
   }
 
 }

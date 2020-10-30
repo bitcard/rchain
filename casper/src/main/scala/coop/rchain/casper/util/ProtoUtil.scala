@@ -10,7 +10,7 @@ import com.google.protobuf.{ByteString, Int32Value, StringValue}
 import coop.rchain.blockstorage.BlockStore
 import coop.rchain.blockstorage.dag.BlockDagRepresentation
 import coop.rchain.blockstorage.syntax._
-import coop.rchain.casper.PrettyPrinter
+import coop.rchain.casper.{PrettyPrinter, ValidatorIdentity}
 import coop.rchain.casper.protocol.{DeployData, _}
 import coop.rchain.casper.util.implicits._
 import coop.rchain.crypto.codec.Base16
@@ -269,7 +269,7 @@ object ProtoUtil {
   def protoSeqHash[A <: { def toByteArray: Array[Byte] }](protoSeq: Seq[A]): ByteString =
     hashByteArrays(protoSeq.map(_.toByteArray): _*)
 
-  private def hashByteArrays(items: Array[Byte]*): ByteString =
+  def hashByteArrays(items: Array[Byte]*): ByteString =
     ByteString.copyFrom(Blake2b256.hash(Array.concat(items: _*)))
 
   // TODO inline this
@@ -289,79 +289,45 @@ object ProtoUtil {
       body: Body,
       header: Header,
       justifications: Seq[Justification],
-      shardId: String
+      shardId: String,
+      seqNum: Int = 0
   ): BlockMessage = {
-    val hash = hashUnsignedBlock(header, justifications)
-
     // TODO FIX-ME fields that can be empty SHOULD be optional
-    BlockMessage(
-      hash,
+    val block = BlockMessage(
+      blockHash = ByteString.EMPTY,
       header,
       body,
       justifications.toList,
       sender = ByteString.EMPTY,
-      seqNum = 0,
+      seqNum = seqNum,
       sig = ByteString.EMPTY,
       sigAlgorithm = "",
       shardId,
       extraBytes = ByteString.EMPTY
     )
+
+    val hash = hashUnsignedBlock(block)
+
+    block.copy(blockHash = hash)
   }
 
-  def hashUnsignedBlock(header: Header, justifications: Seq[Justification]): BlockHash = {
-    val items = header.toProto.toByteArray +: justifications.map(_.toProto.toByteArray)
-    hashByteArrays(items: _*)
+  def hashUnsignedBlock(blockMessage: BlockMessage): BlockHash = {
+    val toHash = blockMessage.header.toProto.toByteArray +: blockMessage.justifications.map(
+      _.toProto.toByteArray
+    )
+    hashByteArrays(toHash: _*)
   }
 
-  def hashSignedBlock(
-      header: Header,
-      body: Body,
-      sender: ByteString,
-      sigAlgorithm: String,
-      seqNum: Int,
-      shardId: String,
-      extraBytes: ByteString
-  ): BlockHash =
-    hashByteArrays(
-      header.toProto.toByteArray,
-      body.toProto.toByteArray,
-      sender.toByteArray,
-      StringValue.of(sigAlgorithm).toByteArray,
-      Int32Value.of(seqNum).toByteArray,
-      StringValue.of(shardId).toByteArray,
-      extraBytes.toByteArray
+  def hashSignedBlock(blockMessage: BlockMessage): BlockHash =
+    ProtoUtil.hashByteArrays(
+      blockMessage.header.toProto.toByteArray,
+      blockMessage.body.toProto.toByteArray,
+      blockMessage.sender.toByteArray,
+      StringValue.of(blockMessage.sigAlgorithm).toByteArray,
+      Int32Value.of(blockMessage.seqNum).toByteArray,
+      StringValue.of(blockMessage.shardId).toByteArray,
+      blockMessage.extraBytes.toByteArray
     )
-
-  def signBlock(
-      block: BlockMessage,
-      sk: PrivateKey,
-      sigAlgorithm: String,
-      shardId: String,
-      seqNum: Int,
-      sender: Validator
-  ): BlockMessage = {
-
-    val header = block.header
-    val blockHash = hashSignedBlock(
-      header,
-      block.body,
-      sender,
-      sigAlgorithm,
-      seqNum,
-      shardId,
-      block.extraBytes
-    )
-    val sigAlgorithmBlock = block.copy(sigAlgorithm = sigAlgorithm)
-    val sig               = ByteString.copyFrom(sigAlgorithmBlock.signFunction(blockHash.toByteArray, sk))
-    sigAlgorithmBlock.copy(
-      sender = sender,
-      sig = sig,
-      seqNum = seqNum,
-      blockHash = blockHash,
-      shardId = shardId
-    )
-  }
-
   def hashString(b: BlockMessage): String = Base16.encode(b.blockHash.toByteArray)
 
   def stringToByteString(string: String): ByteString =
@@ -396,46 +362,57 @@ object ProtoUtil {
     import cats.instances.stream._
 
     for {
-      latestMessages        <- dag.latestMessages
-      latestMessagesOfBlock <- toLatestMessage(block.justifications, dag)
-      unseenBlockHashesAndLatestMessages <- latestMessages.toStream
-                                             .traverse {
-                                               case (validator, latestMessage) =>
-                                                 getJustificationChainFromLatestMessageToBlock(
-                                                   dag,
-                                                   latestMessagesOfBlock,
-                                                   validator,
-                                                   latestMessage
-                                                 )
-                                             }
-                                             .map(_.flatten.toSet)
-    } yield unseenBlockHashesAndLatestMessages -- latestMessagesOfBlock.values.map(_.blockHash) - block.blockHash
+      dagsLatestMessages   <- dag.latestMessages
+      blocksLatestMessages <- toLatestMessage(block.justifications, dag)
+
+      // From input block perspective we want to find what latest messages are not seen
+      //  that are in the DAG latest messages.
+      // - if validator is not in the justification of the block
+      // - if justification contains validator's newer latest message
+      unseenLatestMessages = dagsLatestMessages.filter {
+        case (validator, dagLatestMessage) =>
+          val validatorInJustification = blocksLatestMessages.contains(validator)
+          def blockHasNewerLatestMessage =
+            blocksLatestMessages.get(validator).map(dagLatestMessage.seqNum > _.seqNum)
+
+          !validatorInJustification || (validatorInJustification && blockHasNewerLatestMessage.get)
+      }
+
+      unseenBlockHashes <- unseenLatestMessages.toStream
+                            .traverse {
+                              case (validator, unseenLatestMessage) =>
+                                getCreatorBlocksBetween(
+                                  dag,
+                                  unseenLatestMessage,
+                                  blocksLatestMessages.get(validator)
+                                )
+                            }
+                            .map(_.flatten.toSet)
+    } yield unseenBlockHashes -- blocksLatestMessages.values.map(_.blockHash) - block.blockHash
   }
 
-  private def getJustificationChainFromLatestMessageToBlock[F[_]: Sync: BlockStore](
+  private def getCreatorBlocksBetween[F[_]: Sync](
       dag: BlockDagRepresentation[F],
-      latestMessagesOfBlock: Map[Validator, BlockMetadata],
-      validator: Validator,
-      latestMessage: BlockMetadata
+      topBlock: BlockMetadata,
+      bottomBlock: Option[BlockMetadata]
   ): F[Set[BlockHash]] =
-    latestMessagesOfBlock.get(validator) match {
-      case Some(latestMessageOfBlockByValidator) =>
+    bottomBlock match {
+      case None => Set(topBlock.blockHash).pure[F]
+      case Some(bottomBlock) =>
         DagOperations
-          .bfTraverseF(List(latestMessage))(
-            block =>
+          .bfTraverseF(List(topBlock))(
+            nextCreatorBlock =>
               getCreatorJustificationUnlessGoal(
                 dag,
-                block,
-                latestMessageOfBlockByValidator
+                nextCreatorBlock,
+                bottomBlock
               )
           )
           .map(_.blockHash)
           .toSet
-      case None =>
-        Set.empty[BlockHash].pure
     }
 
-  private def getCreatorJustificationUnlessGoal[F[_]: Sync: BlockStore](
+  private def getCreatorJustificationUnlessGoal[F[_]: Sync](
       dag: BlockDagRepresentation[F],
       block: BlockMetadata,
       goal: BlockMetadata
@@ -451,7 +428,10 @@ object ProtoUtil {
             }
           case None =>
             Sync[F].raiseError[List[BlockMetadata]](
-              new RuntimeException(s"Missing block hash $hash in block dag.")
+              new RuntimeException(
+                s"BlockDAG is missing justification ${PrettyPrinter
+                  .buildString(hash)} for ${PrettyPrinter.buildString(block.blockHash)}."
+              )
             )
         }
       case None =>

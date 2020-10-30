@@ -11,6 +11,7 @@ import coop.rchain.casper.DeployError._
 import coop.rchain.casper.{ReportingCasper, ReportingProtoTransformer, _}
 import coop.rchain.casper.engine.EngineCell._
 import coop.rchain.casper.engine._
+import coop.rchain.casper.genesis.contracts.StandardDeploys
 import coop.rchain.casper.protocol._
 import coop.rchain.casper.syntax._
 import coop.rchain.casper.util._
@@ -61,6 +62,13 @@ object BlockAPI {
           )
         )
 
+    // Check if deploy is signed with system keys
+    val isForbiddenKey = StandardDeploys.systemPublicKeys.contains(d.pk)
+    val forbiddenKeyError = new RuntimeException(
+      s"Deploy refused because it's signed with forbidden private key."
+    ).raiseError[F, ApiErr[String]]
+    val forbiddenKeyCheck = forbiddenKeyError.whenA(isForbiddenKey)
+
     // Check if deploy has minimum phlo price
     val minPhloPrice = 1
     val minPriceError = new RuntimeException(
@@ -68,12 +76,13 @@ object BlockAPI {
     ).raiseError[F, ApiErr[String]]
     val minPhloPriceCheck = minPriceError.whenA(d.data.phloPrice < minPhloPrice)
 
+    // Error message in case Casper is not ready
     val errorMessage = "Could not deploy, casper instance was not available yet."
     val logErrorMessage = Log[F]
       .warn(errorMessage)
       .as(s"Error: $errorMessage".asLeft[String])
 
-    minPhloPriceCheck >> EngineCell[F].read >>= (_.withCasper[ApiErr[String]](
+    forbiddenKeyCheck >> minPhloPriceCheck >> EngineCell[F].read >>= (_.withCasper[ApiErr[String]](
       casperDeploy,
       logErrorMessage
     ))
@@ -825,7 +834,8 @@ object BlockAPI {
   def exploratoryDeploy[F[_]: Sync: EngineCell: Log: SafetyOracle: BlockStore](
       term: String,
       blockHash: Option[String] = none,
-      usePreStateHash: Boolean = false
+      usePreStateHash: Boolean = false,
+      devMode: Boolean = false
   ): F[ApiErr[(Seq[Par], LightBlockInfo)]] = {
     val errorMessage =
       "Could not execute exploratory deploy, casper instance was not available yet."
@@ -833,43 +843,41 @@ object BlockAPI {
       _.withCasper(
         implicit casper =>
           for {
-            isReadOnly <- casper.getValidator
-            result <- isReadOnly match {
-                       case Some(_) =>
-                         "Exploratory deploy can only be executed on read-only RNode."
-                           .asLeft[(Seq[Par], LightBlockInfo)]
-                           .pure[F]
-                       case None =>
-                         for {
-                           targetBlock <- if (blockHash.isEmpty)
-                                           casper.lastFinalizedBlock.map(_.some)
-                                         else
-                                           for {
-                                             hashByteString <- Base16
-                                                                .decode(blockHash.getOrElse(""))
-                                                                .map(ByteString.copyFrom)
-                                                                .liftTo[F](
-                                                                  BlockRetrievalError(
-                                                                    s"Input hash value is not valid hex string: $blockHash"
-                                                                  )
+            isReadOnly <- casper.getValidator.map(_.isEmpty)
+            result <- if (isReadOnly || devMode) {
+                       for {
+                         targetBlock <- if (blockHash.isEmpty)
+                                         casper.lastFinalizedBlock.map(_.some)
+                                       else
+                                         for {
+                                           hashByteString <- Base16
+                                                              .decode(blockHash.getOrElse(""))
+                                                              .map(ByteString.copyFrom)
+                                                              .liftTo[F](
+                                                                BlockRetrievalError(
+                                                                  s"Input hash value is not valid hex string: $blockHash"
                                                                 )
-                                             block <- BlockStore[F].get(hashByteString)
-                                           } yield block
-                           res <- targetBlock.traverse(b => {
-                                   val postStateHash =
-                                     if (usePreStateHash) ProtoUtil.preStateHash(b)
-                                     else ProtoUtil.postStateHash(b)
-                                   for {
-                                     runtimeManager <- casper.getRuntimeManager
-                                     res <- runtimeManager
-                                             .playExploratoryDeploy(term, postStateHash)
-                                     lightBlockInfo <- getLightBlockInfo[F](b)
-                                   } yield (res, lightBlockInfo)
-                                 })
-
-                         } yield res.fold(
-                           s"Can not find block ${blockHash}".asLeft[(Seq[Par], LightBlockInfo)]
-                         )(_.asRight[Error])
+                                                              )
+                                           block <- BlockStore[F].get(hashByteString)
+                                         } yield block
+                         res <- targetBlock.traverse(b => {
+                                 val postStateHash =
+                                   if (usePreStateHash) ProtoUtil.preStateHash(b)
+                                   else ProtoUtil.postStateHash(b)
+                                 for {
+                                   runtimeManager <- casper.getRuntimeManager
+                                   res <- runtimeManager
+                                           .playExploratoryDeploy(term, postStateHash)
+                                   lightBlockInfo <- getLightBlockInfo[F](b)
+                                 } yield (res, lightBlockInfo)
+                               })
+                       } yield res.fold(
+                         s"Can not find block ${blockHash}".asLeft[(Seq[Par], LightBlockInfo)]
+                       )(_.asRight[Error])
+                     } else {
+                       "Exploratory deploy can only be executed on read-only RNode."
+                         .asLeft[(Seq[Par], LightBlockInfo)]
+                         .pure[F]
                      }
           } yield result,
         Log[F].warn(errorMessage).as(s"Error: $errorMessage".asLeft)
