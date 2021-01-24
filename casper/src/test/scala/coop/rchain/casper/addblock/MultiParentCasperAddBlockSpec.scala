@@ -1,15 +1,15 @@
 package coop.rchain.casper.addblock
 
 import cats.effect.Sync
-import cats.implicits._
+import cats.syntax.all._
 import com.google.protobuf.ByteString
 import coop.rchain.blockstorage.syntax._
+import coop.rchain.casper._
 import coop.rchain.casper.helper.TestNode._
 import coop.rchain.casper.helper.{BlockUtil, TestNode}
 import coop.rchain.casper.protocol._
 import coop.rchain.casper.util.rholang.RegistrySigGen
 import coop.rchain.casper.util.{ConstructDeploy, ProtoUtil, RSpaceUtil}
-import coop.rchain.casper._
 import coop.rchain.catscontrib.TaskContrib.TaskOps
 import coop.rchain.comm.rp.ProtocolHelper.packet
 import coop.rchain.crypto.codec.Base16
@@ -224,7 +224,7 @@ class MultiParentCasperAddBlockSpec extends FlatSpec with Matchers with Inspecto
         block            <- node.createBlock(basicDeployData)
         dag              <- node.blockDagStorage.getRepresentation
         (sk, pk)         = Secp256k1.newKeyPair
-        validatorId      = ValidatorIdentity[Effect](sk)
+        validatorId      = ValidatorIdentity(sk)
         sender           = ByteString.copyFrom(pk.bytes)
         latestMessageOpt <- dag.latestMessage(sender)
         seqNum           = latestMessageOpt.fold(0)(_.seqNum) + 1
@@ -558,7 +558,7 @@ class MultiParentCasperAddBlockSpec extends FlatSpec with Matchers with Inspecto
       for {
         latestMessageOpt <- dag.latestMessage(sender)
         seqNum           = latestMessageOpt.fold(0)(_.seqNum) + 1
-        block = ValidatorIdentity[Effect](defaultValidatorSks(1)).signBlock(
+        block = ValidatorIdentity(defaultValidatorSks(1)).signBlock(
           blockThatPointsToInvalidBlock
         )
       } yield block

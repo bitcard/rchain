@@ -22,8 +22,7 @@ import scodec.Codec
 
 abstract class RSpaceOps[F[_]: Concurrent: Metrics, C, P, A, K](
     historyRepository: HistoryRepository[F, C, P, A, K],
-    val storeAtom: AtomicAny[HotStore[F, C, P, A, K]],
-    val branch: Branch
+    val storeAtom: AtomicAny[HotStore[F, C, P, A, K]]
 )(
     implicit
     serializeC: Serialize[C],
@@ -66,7 +65,7 @@ abstract class RSpaceOps[F[_]: Concurrent: Metrics, C, P, A, K](
       )
       .toMap
 
-  implicit val codecC = serializeC.toCodec
+  implicit val codecC = serializeC.toSizeHeadCodec
   val syncF: Sync[F]  = Concurrent[F]
 
   private val lockF: TwoStepLock[F, Blake2b256Hash] = new ConcurrentTwoStepLockF(MetricsSource)
@@ -325,7 +324,7 @@ abstract class RSpaceOps[F[_]: Concurrent: Metrics, C, P, A, K](
       _           = eventLog.put(Seq.empty)
       _           = produceCounter.take()
       _           = produceCounter.put(Map.empty.withDefaultValue(0))
-      _           <- createNewHotStore(nextHistory)(serializeK.toCodec)
+      _           <- createNewHotStore(nextHistory)(serializeK.toSizeHeadCodec)
       _           <- restoreInstalls()
     } yield ()
   }
@@ -352,7 +351,7 @@ abstract class RSpaceOps[F[_]: Concurrent: Metrics, C, P, A, K](
 
   override def revertToSoftCheckpoint(checkpoint: SoftCheckpoint[C, P, A, K]): F[Unit] =
     spanF.trace(revertSoftCheckpointSpanLabel) {
-      implicit val ck: Codec[K] = serializeK.toCodec
+      implicit val ck: Codec[K] = serializeK.toSizeHeadCodec
       val history               = historyRepositoryAtom.get()
       for {
         hotStore <- HotStore.from(checkpoint.cacheSnapshot.cache, history)
@@ -364,8 +363,6 @@ abstract class RSpaceOps[F[_]: Concurrent: Metrics, C, P, A, K](
         _ = produceCounter.put(checkpoint.produceCounter)
       } yield ()
     }
-
-  override def close(): F[Unit] = historyRepositoryAtom.get().close()
 
   def wrapResult(
       channels: Seq[C],

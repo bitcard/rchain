@@ -1,7 +1,9 @@
 package coop.rchain.rholang
 
 import coop.rchain.metrics
-import coop.rchain.metrics.Metrics
+import coop.rchain.metrics.{Metrics, NoopSpan, Span}
+import coop.rchain.models.Expr.ExprInstance.{GInt, GString}
+import coop.rchain.models.{Expr, Par}
 import coop.rchain.rholang.Resources.mkRuntime
 import coop.rchain.rholang.interpreter.accounting._
 import coop.rchain.rholang.interpreter.storage.StoragePrinter
@@ -12,11 +14,8 @@ import monix.execution.Scheduler.Implicits.global
 import org.scalatest.{FlatSpec, Matchers}
 
 import scala.concurrent.duration._
-import coop.rchain.metrics.Span
-import coop.rchain.metrics.NoopSpan
 
 class InterpreterSpec extends FlatSpec with Matchers {
-  private val mapSize     = 1024L * 1024L * 1024L
   private val tmpPrefix   = "rspace-store-"
   private val maxDuration = 5.seconds
 
@@ -30,7 +29,7 @@ class InterpreterSpec extends FlatSpec with Matchers {
 
     val sendRho = "@{0}!(0)"
 
-    mkRuntime[Task](tmpPrefix, mapSize)
+    mkRuntime[Task](tmpPrefix)
       .use { runtime =>
         for {
           initStorage           <- storageContents(runtime)
@@ -53,7 +52,7 @@ class InterpreterSpec extends FlatSpec with Matchers {
   }
 
   it should "yield correct results for the PrimeCheck contract" in {
-    val contents = mkRuntime[Task](tmpPrefix, mapSize)
+    val tupleSpace = mkRuntime[Task](tmpPrefix)
       .use { runtime =>
         for {
           _ <- success(
@@ -84,32 +83,29 @@ class InterpreterSpec extends FlatSpec with Matchers {
             """.stripMargin
               )
 
-          contents <- storageContents(runtime)
-        } yield contents
+          tupleSpace <- runtime.space.toMap
+        } yield tupleSpace
       }
       .runSyncUnsafe(maxDuration)
 
-    // TODO: this is not the way we should be testing execution results,
-    // yet strangely it works - and we don't have a better way for now
-    assert(
-      contents.startsWith(
-        Seq(
-          """@{0}!("Nil") |""",
-          """@{0}!("Pr") |""",
-          """@{0}!("Co") |""",
-          """@{0}!("Pr") |""",
-          """@{0}!("Co") |""",
-          """@{0}!("Nil") |""",
-          """@{0}!("Pr") |"""
-        ).mkString("\n")
-      )
-    )
+    def rhoPar(e: Expr)      = Seq(Par(exprs = Seq(e)))
+    def rhoInt(n: Long)      = rhoPar(Expr(GInt(n)))
+    def rhoString(s: String) = rhoPar(Expr(GString(s)))
+
+    // Get values on zero channel
+    val chZero  = rhoInt(0)
+    val results = tupleSpace(chZero).data.map(x => x.a.pars)
+
+    // Expected values
+    val expected = Seq("Nil", "Nil", "Pr", "Pr", "Pr", "Co", "Co") map rhoString
+
+    results.toSet shouldBe expected.toSet
   }
 
   it should "signal syntax errors to the caller" in {
     val badRholang = "new f, x in { f(x) }"
     val EvaluateResult(_, errors) =
-      mkRuntime[Task](tmpPrefix, mapSize)
+      mkRuntime[Task](tmpPrefix)
         .use { runtime =>
           execute(runtime, badRholang)
         }
@@ -122,7 +118,7 @@ class InterpreterSpec extends FlatSpec with Matchers {
   it should "capture rholang parsing errors and charge for parsing" in {
     val badRholang = """ for(@x <- @"x"; @y <- @"y"){ @"xy"!(x + y) | @"x"!(1) | @"y"!("hi") """
     val EvaluateResult(cost, errors) =
-      mkRuntime[Task](tmpPrefix, mapSize)
+      mkRuntime[Task](tmpPrefix)
         .use { runtime =>
           execute(runtime, badRholang)
         }
@@ -136,7 +132,7 @@ class InterpreterSpec extends FlatSpec with Matchers {
     val sendRho     = "@{0}!(0)"
     val initialPhlo = parsingCost(sendRho) - Cost(1)
     val EvaluateResult(cost, errors) =
-      mkRuntime[Task](tmpPrefix, mapSize)
+      mkRuntime[Task](tmpPrefix)
         .use { runtime =>
           implicit val c = runtime.cost
           InterpreterUtil.evaluateResult(runtime, sendRho, initialPhlo)

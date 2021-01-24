@@ -194,6 +194,10 @@ final case class Options(arguments: Seq[String]) extends ScallopConf(arguments) 
         "in `<genesis-path>/<public_key>.sk`" +
         "This param specifies number of validator identites to generate."
     )
+    val disableLfs = opt[Flag](
+      descr =
+        "Disable the node to start from Last Finalized State, instead it will start from genesis."
+    )
 
     val host = opt[String](
       descr = "Address to bind RChain Protocol server."
@@ -205,6 +209,10 @@ final case class Options(arguments: Seq[String]) extends ScallopConf(arguments) 
 
     val allowPrivateAddresses = opt[Flag](
       descr = "Allow connections to peers with private network addresses."
+    )
+
+    val disableStateExporter = opt[Flag](
+      descr = "Disable the node respond to export state requests."
     )
 
     val networkTimeout = opt[FiniteDuration](
@@ -341,26 +349,6 @@ final case class Options(arguments: Seq[String]) extends ScallopConf(arguments) 
     val dataDir = opt[Path](
       required = false,
       descr = "Path to data directory. Defaults to $HOME/.rnode"
-    )
-
-    val lmdbMapSizeRspace = opt[Long](
-      required = false,
-      descr = "Map size (in bytes) for RSpace"
-    )
-
-    val lmdbMapSizeBlockdagstore = opt[Long](
-      required = false,
-      descr = "Map size (in bytes) for blockDAG store index"
-    )
-
-    val lmdbMapSizeBlockstore = opt[Long](
-      required = false,
-      descr = "Map size (in bytes) for block store index"
-    )
-
-    val lmdbMapSizeDeploystore = opt[Long](
-      required = false,
-      descr = "Map size (in bytes) for deploy storage"
     )
 
     val shardName = opt[String](

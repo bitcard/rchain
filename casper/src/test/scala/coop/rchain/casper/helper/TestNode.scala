@@ -1,26 +1,21 @@
 package coop.rchain.casper.helper
 
-import java.net.URLEncoder
-import java.nio.file.Path
-
-import cats.Monad
 import cats.data.State
 import cats.effect.concurrent.{Ref, Semaphore}
-import cats.effect.{Concurrent, Resource, Sync}
-import cats.implicits._
+import cats.effect.{Concurrent, ContextShift, Resource, Sync}
+import cats.syntax.all._
+import cats.{Monad, Parallel}
 import coop.rchain.blockstorage._
 import coop.rchain.blockstorage.casperbuffer.CasperBufferStorage
-import coop.rchain.blockstorage.dag.{BlockDagFileStorage, BlockDagStorage}
-import coop.rchain.blockstorage.deploy.{DeployStorage, InMemDeployStorage, LMDBDeployStorage}
-import coop.rchain.blockstorage.finality.{LastFinalizedFileStorage, LastFinalizedStorage}
+import coop.rchain.blockstorage.dag.{BlockDagKeyValueStorage, BlockDagStorage}
+import coop.rchain.blockstorage.deploy.DeployStorage
+import coop.rchain.blockstorage.finality.{LastFinalizedKeyValueStorage, LastFinalizedStorage}
 import coop.rchain.casper
-import casper.engine.BlockRetriever._
-import coop.rchain.casper.MultiParentCasper.ignoreDoppelgangerCheck
 import coop.rchain.casper._
 import coop.rchain.casper.api.{BlockAPI, GraphConfig, GraphzGenerator}
+import coop.rchain.casper.engine.BlockRetriever._
 import coop.rchain.casper.engine.EngineCell._
 import coop.rchain.casper.engine._
-import coop.rchain.casper.helper.BlockDagStorageTestFixture.mapSize
 import coop.rchain.casper.protocol._
 import coop.rchain.casper.util.GenesisBuilder.GenesisContext
 import coop.rchain.casper.util.ProtoUtil
@@ -44,6 +39,8 @@ import monix.eval.Task
 import monix.execution.Scheduler
 import org.scalatest.Assertions
 
+import java.net.URLEncoder
+import java.nio.file.Path
 import scala.concurrent.duration.{FiniteDuration, MILLISECONDS}
 
 class TestNode[F[_]](
@@ -54,8 +51,6 @@ class TestNode[F[_]](
     val genesis: BlockMessage,
     sk: PrivateKey,
     logicalTime: LogicalTime[F],
-    val blockDagDir: Path,
-    val blockStoreDir: Path,
     blockProcessingLock: Semaphore[F],
     synchronyConstraintThreshold: Double,
     maxNumberOfParents: Int = Estimator.UnlimitedParents,
@@ -82,11 +77,11 @@ class TestNode[F[_]](
   implicit val transportLayerEff            = tle
   implicit val cliqueOracleEffect           = SafetyOracle.cliqueOracle[F]
   implicit val lastFinalizedBlockCalculator = LastFinalizedBlockCalculator[F](0f)
+  implicit val estimator                    = Estimator[F](maxNumberOfParents, maxParentDepth)
   implicit val synchronyConstraintChecker =
     SynchronyConstraintChecker[F](synchronyConstraintThreshold)
   implicit val lastFinalizedHeightConstraintChecker =
     LastFinalizedHeightConstraintChecker[F](Long.MaxValue)
-  implicit val estimator = Estimator[F](maxNumberOfParents, maxParentDepth)
   implicit val rpConfAsk = createRPConfAsk[F](local)
   implicit val eventBus  = EventPublisher.noop[F]
 
@@ -123,14 +118,14 @@ class TestNode[F[_]](
   implicit val casperEff = new MultiParentCasperImpl[F](
     validatorId,
     genesis,
-    postGenesisStateHash,
     shardId,
     finalizationRate,
     blockProcessingLock,
     blockProcessingState
   )
 
-  val engine                             = new Running(casperEff, approvedBlock, validatorId, ().pure[F])
+  implicit val rspaceMan                 = RSpaceStateManagerTestImpl()
+  val engine                             = new Running(casperEff, approvedBlock, validatorId, ().pure[F], true)
   implicit val engineCell: EngineCell[F] = Cell.unsafe[F, Engine[F]](engine)
   implicit val packetHandlerEff          = CasperPacketHandler[F]
 
@@ -165,7 +160,7 @@ class TestNode[F[_]](
       Created(block)    = createBlockResult
     } yield block
 
-  def receive(): F[Unit] = tls.receive(p => handle[F](p), kp(().pure[F])).void
+  def receive(): F[Unit] = tls.handleReceive(p => handle[F](p), kp(().pure[F])).void
 
   val maxSyncAttempts = 10
   def syncWith(nodes: Seq[TestNode[F]]): F[Unit] = {
@@ -268,57 +263,50 @@ class TestNode[F[_]](
 object TestNode {
   type Effect[A] = Task[A]
 
-  def standaloneEff(
-      genesis: GenesisContext,
-      storageSize: Long = 1024L * 1024 * 10
-  )(
+  def standaloneEff(genesis: GenesisContext)(
       implicit scheduler: Scheduler
   ): Resource[Effect, TestNode[Effect]] =
     networkEff(
       genesis,
-      networkSize = 1,
-      storageSize = storageSize
+      networkSize = 1
     ).map(_.head)
 
   def networkEff(
       genesis: GenesisContext,
       networkSize: Int,
-      storageSize: Long = 1024L * 1024 * 10,
       synchronyConstraintThreshold: Double = 0d,
       maxNumberOfParents: Int = Estimator.UnlimitedParents,
       maxParentDepth: Option[Int] = None,
       withReadOnlySize: Int = 0
-  )(implicit scheduler: Scheduler): Resource[Effect, IndexedSeq[TestNode[Effect]]] =
+  )(implicit scheduler: Scheduler): Resource[Effect, IndexedSeq[TestNode[Effect]]] = {
+    implicit val c = Concurrent[Effect]
+    implicit val n = TestNetwork.empty[Effect]
+
     networkF[Effect](
       genesis.validatorSks.take(networkSize + withReadOnlySize).toVector,
       genesis.genesisBlock,
       genesis.storageDirectory,
-      Resources.mkRuntimeManagerWithHistoryAt[Effect](_)(storageSize),
       synchronyConstraintThreshold,
       maxNumberOfParents,
       maxParentDepth,
       withReadOnlySize
-    )(
-      Concurrent[Effect],
-      TestNetwork.empty[Effect]
     )
+  }
 
-  private def networkF[F[_]: Concurrent: TestNetwork](
+  private def networkF[F[_]: Concurrent: Parallel: ContextShift: TestNetwork](
       sks: IndexedSeq[PrivateKey],
       genesis: BlockMessage,
       storageMatrixPath: Path,
-      createRuntime: Path => Resource[F, (RuntimeManager[F], RhoHistoryRepository[F])],
       synchronyConstraintThreshold: Double,
       maxNumberOfParents: Int,
       maxParentDepth: Option[Int],
       withReadOnlySize: Int
-  ): Resource[F, IndexedSeq[TestNode[F]]] = {
-    val n          = sks.length
-    val names      = (1 to n).map(i => if (i <= (n - withReadOnlySize)) s"node-$i" else s"readOnly-$i")
-    val isReadOnly = (1 to n).map(i => if (i <= (n - withReadOnlySize)) false else true)
-    val peers      = names.map(peerNode(_, 40400))
-
-    val logicalTime: LogicalTime[F] = new LogicalTime[F]
+  )(implicit s: Scheduler): Resource[F, IndexedSeq[TestNode[F]]] = {
+    val n           = sks.length
+    val names       = (1 to n).map(i => if (i <= (n - withReadOnlySize)) s"node-$i" else s"readOnly-$i")
+    val isReadOnly  = (1 to n).map(i => if (i <= (n - withReadOnlySize)) false else true)
+    val peers       = names.map(peerNode(_, 40400))
+    val logicalTime = new LogicalTime[F]
 
     val nodesF =
       names
@@ -335,7 +323,6 @@ object TestNode {
               sk,
               storageMatrixPath,
               logicalTime,
-              createRuntime,
               synchronyConstraintThreshold,
               maxNumberOfParents,
               maxParentDepth,
@@ -344,111 +331,92 @@ object TestNode {
         }
         .map(_.toVector)
 
-    nodesF.flatMap { nodes =>
+    nodesF.evalMap { nodes =>
       import Connections._
       //make sure all nodes know about each other
-      Resource.liftF(
-        for {
-          _ <- ().pure[F]
-          pairs = for {
-            n <- nodes
-            m <- nodes
-            if n.local != m.local
-          } yield (n, m)
-          _ <- pairs.foldLeft(().pure[F]) {
-                case (f, (n, m)) =>
-                  f.flatMap(
-                    _ =>
-                      n.connectionsCell.flatModify(
-                        _.addConn[F](m.local)
-                      )
-                  )
-              }
-        } yield nodes
-      )
+      for {
+        _ <- ().pure[F]
+        pairs = for {
+          n <- nodes
+          m <- nodes
+          if n.local != m.local
+        } yield (n, m)
+        _ <- pairs.foldLeft(().pure[F]) {
+              case (f, (n, m)) =>
+                f.flatMap(
+                  _ =>
+                    n.connectionsCell.flatModify(
+                      _.addConn[F](m.local)
+                    )
+                )
+            }
+      } yield nodes
     }
   }
 
-  private def createNode[F[_]: Concurrent: TestNetwork](
+  private def createNode[F[_]: Concurrent: Parallel: ContextShift: TestNetwork](
       name: String,
       currentPeerNode: PeerNode,
       genesis: BlockMessage,
       sk: PrivateKey,
       storageMatrixPath: Path,
       logicalTime: LogicalTime[F],
-      createRuntime: Path => Resource[F, (RuntimeManager[F], RhoHistoryRepository[F])],
       synchronyConstraintThreshold: Double,
       maxNumberOfParents: Int,
       maxParentDepth: Option[Int],
       isReadOnly: Boolean
-  ): Resource[F, TestNode[F]] = {
+  )(implicit s: Scheduler): Resource[F, TestNode[F]] = {
     val tle                = new TransportLayerTestImpl[F]()
     val tls                = new TransportLayerServerTestImpl[F](currentPeerNode)
     implicit val log       = Log.log[F]
     implicit val metricEff = new Metrics.MetricsNOP[F]
     implicit val spanEff   = NoopSpan[F]()
+
+    def create(dir: Path, deployStorage: DeployStorage[F]) =
+      for {
+        kvm                 <- Resources.mkTestRNodeStoreManager(dir)
+        blockStore          <- KeyValueBlockStore[F](kvm)
+        blockDDagStore      <- BlockDagKeyValueStorage.create[F](kvm)
+        runtimeManager      <- Resources.mkRuntimeManagerWithHistoryAt[F](kvm)
+        casperBufferStorage <- Resources.mkCasperBufferStorage[F](kvm)
+        lastFinalizedStore <- kvm
+                               .store("last-finalized-block")
+                               .map(LastFinalizedKeyValueStorage[F])
+        _                   <- TestNetwork.addPeer(currentPeerNode)
+        blockProcessingLock <- Semaphore[F](1)
+        node = new TestNode[F](
+          name,
+          currentPeerNode,
+          tle,
+          tls,
+          genesis,
+          sk,
+          logicalTime,
+          blockProcessingLock,
+          synchronyConstraintThreshold,
+          maxNumberOfParents,
+          maxParentDepth,
+          isReadOnly = isReadOnly
+        )(
+          Concurrent[F],
+          blockStore,
+          blockDDagStore,
+          lastFinalizedStore,
+          deployStorage,
+          metricEff,
+          spanEff,
+          casperBufferStorage,
+          runtimeManager._1,
+          runtimeManager._2
+        )
+      } yield node
+
     for {
-      paths <- Resources.copyStorage[F](storageMatrixPath)
-
-      blockStore          <- Resources.mkBlockStoreAt[F](paths.blockStoreDir)
-      blockDagStorage     <- Resources.mkBlockDagStorageAt[F](paths.blockDagDir)
-      deployStorage       <- Resources.mkDeployStorageAt[F](paths.deployStorageDir)
-      casperBufferStorage <- Resources.mkCasperBuferStorate[F](paths.deployStorageDir)
-      runtimeManager      <- createRuntime(paths.rspaceDir)
-
-      node <- Resource.liftF(
-               for {
-                 lastFinalizedStorage <- LastFinalizedFileStorage.make[F](paths.lastFinalizedFile)
-                 _                    <- TestNetwork.addPeer(currentPeerNode)
-                 blockProcessingLock  <- Semaphore[F](1)
-                 node = new TestNode[F](
-                   name,
-                   currentPeerNode,
-                   tle,
-                   tls,
-                   genesis,
-                   sk,
-                   logicalTime,
-                   paths.blockDagDir,
-                   paths.blockStoreDir,
-                   blockProcessingLock,
-                   synchronyConstraintThreshold,
-                   maxNumberOfParents,
-                   maxParentDepth,
-                   isReadOnly = isReadOnly
-                 )(
-                   Concurrent[F],
-                   blockStore,
-                   blockDagStorage,
-                   lastFinalizedStorage,
-                   deployStorage,
-                   metricEff,
-                   spanEff,
-                   casperBufferStorage,
-                   runtimeManager._1,
-                   runtimeManager._2
-                 )
-               } yield node
-             )
+      paths         <- Resources.copyStorage[F](storageMatrixPath)
+      deployStorage <- Resources.mkDeployStorageAt[F](paths.deployStorageDir)
+      node          <- Resource.liftF(create(paths.storageDir, deployStorage))
     } yield node
   }
-
-  def makeBlockDagFileStorageConfig(blockDagDir: Path) =
-    BlockDagFileStorage.Config(
-      blockDagDir.resolve("latest-messages-data"),
-      blockDagDir.resolve("latest-messages-crc"),
-      blockDagDir.resolve("block-metadata-data"),
-      blockDagDir.resolve("block-metadata-crc"),
-      blockDagDir.resolve("equivocations-tracker-data"),
-      blockDagDir.resolve("equivocations-tracker-crc"),
-      blockDagDir.resolve("invalid-blocks-data"),
-      blockDagDir.resolve("invalid-blocks-crc"),
-      blockDagDir.resolve("block-hashes-by-deploy-data"),
-      blockDagDir.resolve("block-hashes-by-deploy-crc"),
-      blockDagDir.resolve("checkpoints"),
-      blockDagDir.resolve("block-number-index"),
-      mapSize
-    )
 
   private def peerNode(name: String, port: Int): PeerNode =
     PeerNode(NodeIdentifier(name.getBytes), endpoint(port))

@@ -7,7 +7,7 @@ import cats.effect._
 import cats.implicits._
 import coop.rchain.catscontrib._
 import coop.rchain.metrics.{Metrics, Span}
-import coop.rchain.rspace.history.{Branch, HistoryRepository}
+import coop.rchain.rspace.history.HistoryRepository
 import coop.rchain.rspace.internal._
 import coop.rchain.rspace.trace.{Produce, _}
 import coop.rchain.shared.{Log, Serialize}
@@ -54,8 +54,7 @@ object ReportingRspace {
 
 class ReportingRspace[F[_]: Sync, C, P, A, K](
     historyRepository: HistoryRepository[F, C, P, A, K],
-    storeAtom: AtomicAny[HotStore[F, C, P, A, K]],
-    branch: Branch
+    storeAtom: AtomicAny[HotStore[F, C, P, A, K]]
 )(
     implicit
     serializeC: Serialize[C],
@@ -69,7 +68,7 @@ class ReportingRspace[F[_]: Sync, C, P, A, K](
     scheduler: ExecutionContext,
     metricsF: Metrics[F],
     spanF: Span[F]
-) extends ReplayRSpace[F, C, P, A, K](historyRepository, storeAtom, branch) {
+) extends ReplayRSpace[F, C, P, A, K](historyRepository, storeAtom) {
 
   protected[this] override val logger: Logger = Logger[this.type]
 
@@ -156,7 +155,7 @@ class ReportingRspace[F[_]: Sync, C, P, A, K](
   override def createCheckpoint(): F[Checkpoint] = syncF.defer {
     val historyRepository = historyRepositoryAtom.get()
     for {
-      _ <- createNewHotStore(historyRepository)(serializeK.toCodec)
+      _ <- createNewHotStore(historyRepository)(serializeK.toSizeHeadCodec)
       _ <- restoreInstalls()
       _ = softReport.update(_ => Seq.empty[ReportingEvent])
       _ = report.update(_ => Seq.empty[Seq[ReportingEvent]])

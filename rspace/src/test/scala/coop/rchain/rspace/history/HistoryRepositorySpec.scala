@@ -1,5 +1,11 @@
 package coop.rchain.rspace.history
 
+import java.nio.ByteBuffer
+
+import cats.effect.Sync
+import coop.rchain.rspace.history.TestData.{randomBlake, zerosBlake}
+import coop.rchain.rspace.internal.{Datum, WaitingContinuation}
+import coop.rchain.rspace.trace.{Consume, Produce}
 import coop.rchain.rspace.{
   util,
   Blake2b256Hash,
@@ -12,17 +18,18 @@ import coop.rchain.rspace.{
   InsertJoins
 }
 import monix.eval.Task
-import org.scalatest.{FlatSpec, Matchers, OptionValues}
-
-import scala.concurrent.duration._
 import monix.execution.Scheduler.Implicits.global
-import coop.rchain.rspace.internal.{Datum, WaitingContinuation}
-import coop.rchain.rspace.history.TestData.{randomBlake, zerosBlake}
-import coop.rchain.rspace.trace.{Consume, Produce}
-
-import scala.collection.concurrent.TrieMap
+import org.scalatest.{FlatSpec, Matchers, OptionValues}
+import scodec.bits.ByteVector
+import scala.concurrent.duration._
 import scala.util.Random
 import cats.implicits._
+import coop.rchain.rspace.Blake2b256Hash.codecPureBlake2b256Hash
+import coop.rchain.rspace.history.ColdStoreInstances.{codecPersistedData, ColdKeyValueStore}
+import coop.rchain.rspace.state.{RSpaceExporter, RSpaceImporter}
+import coop.rchain.state.TrieNode
+import coop.rchain.store.InMemoryKeyValueStore
+import coop.rchain.shared.syntax._
 import scodec.Codec
 
 import scala.collection.SortedSet
@@ -167,7 +174,9 @@ class HistoryRepositorySpec
       repo = HistoryRepositoryImpl[Task, String, String, String, String](
         emptyHistory,
         pastRoots,
-        inMemColdStore
+        inMemColdStore,
+        emptyExporter,
+        emptyImporter
       )
       _ <- f(repo)
     } yield ()).runSyncUnsafe(20.seconds)
@@ -189,7 +198,7 @@ trait InMemoryHistoryRepositoryTestBase extends InMemoryHistoryTestBase {
           maybeCurrentRoot
         }
 
-      override def validateRoot(key: Blake2b256Hash): Task[Option[Blake2b256Hash]] =
+      override def validateAndSetCurrentRoot(key: Blake2b256Hash): Task[Option[Blake2b256Hash]] =
         Task.delay {
           if (roots.contains(key)) {
             maybeCurrentRoot = Some(key)
@@ -205,24 +214,49 @@ trait InMemoryHistoryRepositoryTestBase extends InMemoryHistoryTestBase {
           roots += key
         }
 
-      override def close(): Task[Unit] = Task.delay(())
     }
 
   def rootRepository =
     new RootRepository[Task](inmemRootsStore)
 
-  def inMemColdStore: ColdStore[Task] = new ColdStore[Task] {
-    val data: TrieMap[Blake2b256Hash, PersistedData] = TrieMap.empty
+  def inMemColdStore: ColdKeyValueStore[Task] = {
+    val store = InMemoryKeyValueStore[Task]
+    store.toTypedStore(codecPureBlake2b256Hash, codecPersistedData)
+  }
 
-    override def put(hash: Blake2b256Hash, d: PersistedData): Task[Unit] =
-      Task.delay { data.put(hash, d) }
+  def emptyExporter[F[_]: Sync]: RSpaceExporter[F] = new RSpaceExporter[F] {
+    override def getRoot: F[Blake2b256Hash] = ???
 
-    override def get(hash: Blake2b256Hash): Task[Option[PersistedData]] =
-      Task.delay { data.get(hash) }
+    override def getNodes(
+        startPath: NodePath,
+        skip: Int,
+        take: Int
+    ): F[Seq[TrieNode[Blake2b256Hash]]] = ???
 
-    override def close(): Task[Unit] = Task.delay(())
+    override def getHistoryItems[Value](
+        keys: Seq[Blake2b256Hash],
+        fromBuffer: ByteBuffer => Value
+    ): F[Seq[(Blake2b256Hash, Value)]] = ???
 
-    override def put(list: List[(Blake2b256Hash, PersistedData)]): Task[Unit] =
-      list.traverse_(Function.tupled(put))
+    override def getDataItems[Value](
+        keys: Seq[Blake2b256Hash],
+        fromBuffer: ByteBuffer => Value
+    ): F[Seq[(Blake2b256Hash, Value)]] = ???
+  }
+
+  def emptyImporter[F[_]: Sync]: RSpaceImporter[F] = new RSpaceImporter[F] {
+    override def setHistoryItems[Value](
+        data: Seq[(Blake2b256Hash, Value)],
+        toBuffer: Value => ByteBuffer
+    ): F[Unit] = ???
+
+    override def setDataItems[Value](
+        data: Seq[(Blake2b256Hash, Value)],
+        toBuffer: Value => ByteBuffer
+    ): F[Unit] = ???
+
+    override def setRoot(key: Blake2b256Hash): F[Unit] = ???
+
+    override def getHistoryItem(hash: Blake2b256Hash): F[Option[ByteVector]] = ???
   }
 }

@@ -84,28 +84,33 @@ object ReportMemStore {
       .by(uint2)
       .subcaseP(0)({
         case n: ReportingProduce[C, A] @unchecked => n
-      })(codecReportingProduce(serializeC.toCodec, serializeA.toCodec))
+      })(codecReportingProduce(serializeC.toSizeHeadCodec, serializeA.toSizeHeadCodec))
       .subcaseP(1) {
         case n: ReportingConsume[C, P, K] @unchecked => n
-      }(codecReportingConsume(serializeC.toCodec, serializeP.toCodec, serializeK.toCodec))
+      }(
+        codecReportingConsume(
+          serializeC.toSizeHeadCodec,
+          serializeP.toSizeHeadCodec,
+          serializeK.toSizeHeadCodec
+        )
+      )
       .subcaseP(2) {
         case n: ReportingComm[C, P, A, K] @unchecked => n
       }(
         codecReportingComm(
-          serializeC.toCodec,
-          serializeP.toCodec,
-          serializeA.toCodec,
-          serializeK.toCodec
+          serializeC.toSizeHeadCodec,
+          serializeP.toSizeHeadCodec,
+          serializeA.toSizeHeadCodec,
+          serializeK.toSizeHeadCodec
         )
       )
 
-  def store[F[_]: Sync: Span, C, P, A, K](
+  def store[F[_]: Sync: Span, C, P, A, K](kvm: KeyValueStoreManager[F])(
       implicit
       serializeC: Serialize[C],
       serializeP: Serialize[P],
       serializeA: Serialize[A],
-      serializeK: Serialize[K],
-      kvm: KeyValueStoreManager[F]
+      serializeK: Serialize[K]
   ): F[ReportMemStore[F]] = {
     val codecReporting = reportingCodec[C, P, A, K]
     val codec          = codecSeq[ReportingEvent](codecReporting)

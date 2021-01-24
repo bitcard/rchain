@@ -1,26 +1,16 @@
 package coop.rchain.node.configuration.hocon
 
-import java.nio.file.Paths
-
 import com.typesafe.config.ConfigFactory
-
-import scala.concurrent.duration._
 import coop.rchain.casper.{CasperConf, GenesisBlockData, GenesisCeremonyConf, RoundRobinDispatcher}
-import coop.rchain.comm.{CommError, PeerNode}
 import coop.rchain.comm.transport.TlsConf
-import coop.rchain.node.configuration.{
-  ApiServer,
-  Metrics,
-  NodeConf,
-  PeersDiscovery,
-  ProtocolClient,
-  ProtocolServer,
-  Storage
-}
+import coop.rchain.comm.{CommError, PeerNode}
+import coop.rchain.node.configuration._
 import org.scalatest.{FunSuite, Matchers}
 import pureconfig.{ConfigReader, ConfigSource, ConvertHelpers}
-import pureconfig.generic.ProductHint
 import pureconfig.generic.auto._
+
+import java.nio.file.Paths
+import scala.concurrent.duration._
 
 class HoconConfigurationSpec extends FunSuite with Matchers {
 
@@ -61,7 +51,8 @@ class HoconConfigurationSpec extends FunSuite with Matchers {
         port = 40400,
         grpcMaxRecvMessageSize = 262144,
         grpcMaxRecvStreamMessageSize = 268435456,
-        maxMessageConsumers = 400
+        maxMessageConsumers = 400,
+        disableStateExporter = false
       ),
       protocolClient = ProtocolClient(
         networkId = "testnet",
@@ -71,6 +62,7 @@ class HoconConfigurationSpec extends FunSuite with Matchers {
           )
           .right
           .get,
+        disableLfs = false,
         batchMaxConnections = 20,
         networkTimeout = 5.seconds,
         grpcMaxRecvMessageSize = 262144,
@@ -100,11 +92,7 @@ class HoconConfigurationSpec extends FunSuite with Matchers {
         maxConnectionAgeGrace = 1.hours
       ),
       storage = Storage(
-        dataDir = Paths.get("/var/lib/rnode"),
-        lmdbMapSizeRspace = 10995116277760L,
-        lmdbMapSizeBlockdagstore = 8589934592L,
-        lmdbMapSizeBlockstore = 8589934592L,
-        lmdbMapSizeDeploystore = 1073741824L
+        dataDir = Paths.get("/var/lib/rnode")
       ),
       tls = TlsConf(
         certificatePath = Paths.get("/var/lib/rnode/node.certificate.pem"),

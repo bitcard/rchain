@@ -7,12 +7,12 @@ import scodec.codecs.{discriminated, provide, uint, uint2, vectorOfN}
 import coop.rchain.rspace.internal.codecByteVector
 import coop.rchain.shared.AttemptOps._
 import History._
+import coop.rchain.crypto.codec.Base16
 
 trait History[F[_]] {
   def process(actions: List[HistoryAction]): F[History[F]]
   def root: Blake2b256Hash
   def find(key: KeyPath): F[(TriePointer, Vector[Trie])]
-  def close(): F[Unit]
   def reset(root: Blake2b256Hash): History[F]
 }
 
@@ -48,6 +48,9 @@ final case class Skip(affix: ByteVector, ptr: ValuePointer) extends NonEmptyTrie
   lazy val encoded: BitVector = Trie.codecSkip.encode(this).get
 
   lazy val hash: Blake2b256Hash = Blake2b256Hash.create(encoded.toByteVector)
+
+  override def toString: String =
+    s"Skip(${hash}, ${affix.toHex}\n  ${ptr})"
 }
 
 final case class PointerBlock private (toVector: Vector[TriePointer]) extends NonEmptyTrie {
@@ -63,9 +66,13 @@ final case class PointerBlock private (toVector: Vector[TriePointer]) extends No
   lazy val hash: Blake2b256Hash = Blake2b256Hash.create(encoded.toByteVector)
 
   override def toString: String = {
+    // TODO: this is difficult to visualize, maybe XML representation would be useful?
     val pbs =
-      toVector.zipWithIndex.filter { case (v, _) => v != EmptyPointer }.map(_.swap).mkString(";")
-    s"PB($hash: $pbs)"
+      toVector.zipWithIndex
+        .filter { case (v, _) => v != EmptyPointer }
+        .map { case (v, n) => s"<$v, ${Base16.encode(Array(n.toByte))}>" }
+        .mkString(",\n  ")
+    s"PB(${hash}\n  $pbs)"
   }
 }
 
@@ -120,23 +127,23 @@ object Trie {
       }(provide(EmptyPointer))
       .subcaseP(1) {
         case p: LeafPointer => p
-      }(Blake2b256Hash.codecBlake2b256Hash.as[LeafPointer])
+      }(Blake2b256Hash.codecWithBytesStringBlake2b256Hash.as[LeafPointer])
       .subcaseP(2) {
         case p: SkipPointer => p
-      }(Blake2b256Hash.codecBlake2b256Hash.as[SkipPointer])
+      }(Blake2b256Hash.codecWithBytesStringBlake2b256Hash.as[SkipPointer])
       .subcaseP(3) {
         case p: NodePointer => p
-      }(Blake2b256Hash.codecBlake2b256Hash.as[NodePointer])
+      }(Blake2b256Hash.codecWithBytesStringBlake2b256Hash.as[NodePointer])
 
   implicit def codecTrieValuePointer: Codec[ValuePointer] =
     discriminated[ValuePointer]
       .by(uint(1))
       .subcaseP(0) {
         case p: LeafPointer => p
-      }(Blake2b256Hash.codecBlake2b256Hash.as[LeafPointer])
+      }(Blake2b256Hash.codecWithBytesStringBlake2b256Hash.as[LeafPointer])
       .subcaseP(1) {
         case p: NodePointer => p
-      }(Blake2b256Hash.codecBlake2b256Hash.as[NodePointer])
+      }(Blake2b256Hash.codecWithBytesStringBlake2b256Hash.as[NodePointer])
 
 }
 

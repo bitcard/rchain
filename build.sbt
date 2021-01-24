@@ -101,7 +101,7 @@ lazy val coverageSettings = Seq(
 )
 
 lazy val compilerSettings = CompilerSettings.options ++ Seq(
-  crossScalaVersions := Seq("2.11.12", scalaVersion.value)
+  crossScalaVersions := Seq(scalaVersion.value)
 )
 
 // Before starting sbt export YOURKIT_AGENT set to the profiling agent appropriate
@@ -125,6 +125,7 @@ lazy val shared = (project in file("shared"))
       catsEffect,
       catsMtl,
       catsTagless,
+      fs2Core,
       lz4,
       monix,
       scodecCore,
@@ -134,7 +135,8 @@ lazy val shared = (project in file("shared"))
       lmdbjava,
       catsEffectLawsTest,
       catsLawsTest,
-      catsLawsTestkitTest
+      catsLawsTestkitTest,
+      enumeratum,
     )
   )
 
@@ -163,6 +165,7 @@ lazy val casper = (project in file("casper"))
       catsRetry,
       catsMtl,
       monix,
+      fs2Core,
       scalacheck % "slowcooker"
     )
   )
@@ -172,7 +175,7 @@ lazy val casper = (project in file("casper"))
     shared       % "compile->compile;test->test",
     graphz,
     crypto,
-    models   % "compile->compile;test->test",
+    models % "compile->compile;test->test",
     rspace,
     rholang % "compile->compile;test->test"
   )
@@ -196,9 +199,9 @@ lazy val comm = (project in file("comm"))
       guava
     ),
     PB.targets in Compile := Seq(
-      PB.gens.java                              -> (sourceManaged in Compile).value,
-      scalapb.gen(javaConversions = true)       -> (sourceManaged in Compile).value,
-      grpcmonix.generators.GrpcMonixGenerator() -> (sourceManaged in Compile).value
+      PB.gens.java                                      -> (sourceManaged in Compile).value,
+      scalapb.gen(javaConversions = true, grpc = false) -> (sourceManaged in Compile).value,
+      grpcmonix.generators.gen()                        -> (sourceManaged in Compile).value
     )
   )
   .dependsOn(shared % "compile->compile;test->test", crypto, models)
@@ -226,7 +229,6 @@ lazy val models = (project in file("models"))
   .settings(
     libraryDependencies ++= commonDependencies ++ protobufDependencies ++ Seq(
       catsCore,
-      enumeratum,
       magnolia,
       scalapbCompiler,
       scalacheck % "test",
@@ -234,10 +236,8 @@ lazy val models = (project in file("models"))
       scalapbRuntimegGrpc
     ),
     PB.targets in Compile := Seq(
-      coop.rchain.scalapb.StacksafeScalapbGenerator
-        .gen(flatPackage = true) -> (sourceManaged in Compile).value,
-      grpcmonix.generators
-        .GrpcMonixGenerator(flatPackage = true) -> (sourceManaged in Compile).value
+      coop.rchain.scalapb.gen(flatPackage = true, grpc = false) -> (sourceManaged in Compile).value,
+      grpcmonix.generators.gen()                                -> (sourceManaged in Compile).value
     )
   )
   .dependsOn(shared % "compile->compile;test->test", rspace)
@@ -271,9 +271,10 @@ lazy val node = (project in file("node"))
         pureconfig
       ),
     PB.targets in Compile := Seq(
-      PB.gens.java                              -> (sourceManaged in Compile).value / "protobuf",
-      scalapb.gen(javaConversions = true)       -> (sourceManaged in Compile).value / "protobuf",
-      grpcmonix.generators.GrpcMonixGenerator() -> (sourceManaged in Compile).value / "protobuf"
+      PB.gens.java -> (sourceManaged in Compile).value / "protobuf",
+      scalapb
+        .gen(javaConversions = true, grpc = false) -> (sourceManaged in Compile).value / "protobuf",
+      grpcmonix.generators.gen()                   -> (sourceManaged in Compile).value / "protobuf"
     ),
     buildInfoKeys := Seq[BuildInfoKey](name, version, scalaVersion, sbtVersion, git.gitHeadCommit),
     buildInfoPackage := "coop.rchain.node",
@@ -451,7 +452,6 @@ lazy val blockStorage = (project in file("block-storage"))
     name := "block-storage",
     version := "0.0.1-SNAPSHOT",
     libraryDependencies ++= commonDependencies ++ protobufLibDependencies ++ Seq(
-      lmdbjava,
       catsCore,
       catsEffect,
       catsMtl
@@ -473,6 +473,7 @@ lazy val rspace = (project in file("rspace"))
     libraryDependencies ++= commonDependencies ++ kamonDependencies ++ Seq(
       lmdbjava,
       catsCore,
+      fs2Core,
       scodecCore,
       scodecBits,
       guava
@@ -506,9 +507,9 @@ lazy val rspaceBench = (project in file("rspace-bench"))
   .settings(
     commonSettings,
     libraryDependencies ++= commonDependencies,
-    libraryDependencies += "com.esotericsoftware" % "kryo" % "4.0.2",
+    libraryDependencies += "com.esotericsoftware" % "kryo" % "5.0.3",
     dependencyOverrides ++= Seq(
-      "org.ow2.asm" % "asm" % "5.0.4"
+      "org.ow2.asm" % "asm" % "9.0"
     ),
     sourceDirectory in Jmh := (sourceDirectory in Test).value,
     classDirectory in Jmh := (classDirectory in Test).value,

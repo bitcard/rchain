@@ -1,11 +1,14 @@
 package coop.rchain.casper.engine
 
-import cats._, cats.data._, cats.implicits._
+import cats._
+import cats.data._
+import cats.implicits._
 import cats.effect._
 import cats.effect.concurrent.Ref
 import coop.rchain.casper._
 import coop.rchain.casper.protocol._
 import coop.rchain.catscontrib.TaskContrib._
+import coop.rchain.casper.helper.RSpaceStateManagerTestImpl
 import coop.rchain.shared.{Cell, EventPublisher}
 import monix.eval.Task
 import org.scalatest.WordSpec
@@ -17,7 +20,6 @@ class GenesisCeremonyMasterSpec extends WordSpec {
 
   "GenesisCeremonyMaster" should {
     "make a transition to Running state after block has been approved" in {
-      import monix.execution.Scheduler.Implicits.global
       val fixture = Setup()
       import fixture._
 
@@ -28,6 +30,7 @@ class GenesisCeremonyMasterSpec extends WordSpec {
       val startTime = System.currentTimeMillis()
 
       implicit val engineCell = Cell.unsafe[Task, Engine[Task]](Engine.noop)
+      implicit val rspaceMan  = RSpaceStateManagerTestImpl[Task]()
 
       def waitUtilCasperIsDefined: Task[MultiParentCasper[Task]] =
         EngineCell[Task].read >>= (_.withCasper(
@@ -51,7 +54,8 @@ class GenesisCeremonyMasterSpec extends WordSpec {
           .waitingForApprovedBlockLoop[Task](
             shardId,
             finalizationRate,
-            Some(validatorId)
+            Some(validatorId),
+            disableStateExporter = true
           )
           .startAndForget
           .runToFuture

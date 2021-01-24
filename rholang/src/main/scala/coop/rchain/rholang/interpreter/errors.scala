@@ -1,6 +1,7 @@
 package coop.rchain.rholang.interpreter
 
-import net.logstash.logback.encoder.org.apache.commons.lang.exception.ExceptionUtils
+import coop.rchain.rholang.interpreter.compiler.SourcePosition
+import net.logstash.logback.encoder.org.apache.commons.lang3.exception.ExceptionUtils
 
 object errors {
 
@@ -24,45 +25,37 @@ object errors {
 
   final case class UnexpectedNameContext(
       varName: String,
-      procVarLine: Int,
-      procVarCol: Int,
-      nameContextLine: Int,
-      nameContextCol: Int
+      procVarSourcePosition: SourcePosition,
+      nameSourcePosition: SourcePosition
   ) extends InterpreterError(
-        s"Proc variable: $varName at $procVarLine:$procVarCol used in Name context at $nameContextLine:$nameContextCol"
+        s"Proc variable: $varName at $procVarSourcePosition used in Name context at $nameSourcePosition"
       )
 
   final case class UnexpectedReuseOfNameContextFree(
       varName: String,
-      firstUseLine: Int,
-      firstUseCol: Int,
-      secondUseLine: Int,
-      secondUseCol: Int
+      firstUse: SourcePosition,
+      secondUse: SourcePosition
   ) extends InterpreterError(
         s"Free variable $varName is used twice as a binder " +
-          s"(at $firstUseLine:$firstUseCol and $secondUseLine:$secondUseCol) in name context."
+          s"(at $firstUse and $secondUse) in name context."
       )
 
   final case class UnexpectedProcContext(
       varName: String,
-      nameVarLine: Int,
-      nameVarCol: Int,
-      processContextLine: Int,
-      processContextCol: Int
+      nameVarSourcePosition: SourcePosition,
+      processSourcePosition: SourcePosition
   ) extends InterpreterError(
-        s"Name variable: $varName at $nameVarLine:$nameVarCol " +
-          s"used in process context at $processContextLine:$processContextCol"
+        s"Name variable: $varName at $nameVarSourcePosition " +
+          s"used in process context at $processSourcePosition"
       )
 
   final case class UnexpectedReuseOfProcContextFree(
       varName: String,
-      firstUseLine: Int,
-      firstUseCol: Int,
-      secondUseLine: Int,
-      secondUseCol: Int
+      firstUse: SourcePosition,
+      secondUse: SourcePosition
   ) extends InterpreterError(
         s"Free variable $varName is used twice as a binder " +
-          s"(at $firstUseLine:$firstUseCol and $secondUseLine:$secondUseCol) in process context."
+          s"(at $firstUse and $secondUse) in process context."
       )
 
   final case class UnexpectedBundleContent(message: String)     extends InterpreterError(message)
@@ -114,7 +107,7 @@ object errors {
       interpreterErrors: Vector[InterpreterError],
       errors: Vector[Throwable]
   ) extends InterpreterError(
-        s"Error: Aggregate Error\n${(interpreterErrors ++ errors).map(ExceptionUtils.getFullStackTrace).mkString}"
+        s"Error: Aggregate Error\n${(interpreterErrors ++ errors).map(ExceptionUtils.getStackTrace).mkString}"
       )
 
   // Current implementation of SpaceMatcher (extractDataCandidates) causes unmatched comms

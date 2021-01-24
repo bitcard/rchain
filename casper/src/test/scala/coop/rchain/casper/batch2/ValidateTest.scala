@@ -1,9 +1,7 @@
 package coop.rchain.casper.batch2
 
-import java.nio.file.Files
-
 import cats.Monad
-import cats.implicits._
+import cats.syntax.all._
 import com.google.protobuf.ByteString
 import coop.rchain.blockstorage.BlockStore
 import coop.rchain.blockstorage.dag.IndexedBlockDagStorage
@@ -18,6 +16,7 @@ import coop.rchain.casper.helper.{
 import coop.rchain.casper.protocol._
 import coop.rchain.casper.util.GenesisBuilder.buildGenesis
 import coop.rchain.casper.util._
+import coop.rchain.casper.util.rholang.Resources.mkTestRNodeStoreManager
 import coop.rchain.casper.util.rholang.{InterpreterUtil, RuntimeManager}
 import coop.rchain.casper.{InvalidBlock, ValidBlock, Validate, ValidatorIdentity}
 import coop.rchain.crypto.codec.Base16
@@ -25,15 +24,17 @@ import coop.rchain.crypto.signatures.{Secp256k1, Signed}
 import coop.rchain.crypto.{PrivateKey, PublicKey}
 import coop.rchain.models.BlockHash.BlockHash
 import coop.rchain.models.Validator.Validator
+import coop.rchain.models.blockImplicits._
 import coop.rchain.p2p.EffectsTestInstances.LogStub
 import coop.rchain.rholang.interpreter.Runtime
+import coop.rchain.rspace.syntax.rspaceSyntaxKeyValueStoreManager
 import coop.rchain.shared.Time
 import coop.rchain.shared.scalatestcontrib._
 import monix.eval.Task
 import monix.execution.Scheduler.Implicits.global
 import org.scalatest._
-import coop.rchain.models.blockImplicits._
 
+import java.nio.file.Files
 import scala.collection.immutable.HashMap
 
 class ValidateTest
@@ -106,7 +107,7 @@ class ValidateTest
       sender           = ByteString.copyFrom(pk.bytes)
       latestMessageOpt <- dag.latestMessage(sender)
       seqNum           = latestMessageOpt.fold(0)(_.seqNum) + 1
-      result           = ValidatorIdentity[Task](sk).signBlock(block.copy(seqNum = seqNum))
+      result           = ValidatorIdentity(sk).signBlock(block.copy(seqNum = seqNum))
     } yield result
   }
 
@@ -545,7 +546,7 @@ class ValidateTest
         sender           = ByteString.copyFrom(pk.bytes)
         latestMessageOpt <- dag.latestMessage(sender)
         seqNum           = latestMessageOpt.fold(0)(_.seqNum) + 1
-        signedBlock = ValidatorIdentity[Task](sk).signBlock(
+        signedBlock = ValidatorIdentity(sk).signBlock(
           block.withBlockNumber(17).copy(seqNum = 1)
         )
         _ <- Validate.blockSummary[Task](
@@ -663,7 +664,6 @@ class ValidateTest
                   dag   <- blockDagStorage.getRepresentation
                   result <- Validate.justificationRegressions[Task](
                              block,
-                             b0,
                              dag
                            )
                 } yield result == Right(Valid)
@@ -681,7 +681,6 @@ class ValidateTest
         dag <- blockDagStorage.getRepresentation
         _ <- Validate.justificationRegressions[Task](
               blockWithJustificationRegression,
-              b0,
               dag
             ) shouldBeF Left(JustificationRegression)
         result = log.warns.size shouldBe 1
@@ -715,7 +714,6 @@ class ValidateTest
         dag <- blockDagStorage.getRepresentation
         _ <- Validate.justificationRegressions[Task](
               blockWithInvalidJustification,
-              b0,
               dag
             ) shouldBeF Right(Valid)
       } yield ()
@@ -725,23 +723,25 @@ class ValidateTest
     implicit blockStore => implicit blockDagStorage =>
       val genesis = GenesisBuilder.createGenesis()
 
-      val storageDirectory  = Files.createTempDirectory(s"hash-set-casper-test-genesis-")
-      val storageSize: Long = 1024L * 1024L * 1024L
+      val storageDirectory = Files.createTempDirectory(s"hash-set-casper-test-genesis-")
+
       for {
-        sar               <- Runtime.setupRSpace[Task](storageDirectory, storageSize)
-        activeRuntime     <- Runtime.createWithEmptyCost[Task]((sar._1, sar._2))
-        runtimeManager    <- RuntimeManager.fromRuntime[Task](activeRuntime)
-        dag               <- blockDagStorage.getRepresentation
-        _                 <- InterpreterUtil.validateBlockCheckpoint[Task](genesis, dag, runtimeManager)
-        _                 <- Validate.bondsCache[Task](genesis, runtimeManager) shouldBeF Right(Valid)
-        modifiedBonds     = Seq.empty[Bond]
-        modifiedPostState = genesis.body.state.copy(bonds = modifiedBonds.toList)
-        modifiedBody      = genesis.body.copy(state = modifiedPostState)
-        modifiedGenesis   = genesis.copy(body = modifiedBody)
+        kvm                  <- mkTestRNodeStoreManager[Task](storageDirectory)
+        store                <- kvm.rSpaceStores
+        spaces               <- Runtime.setupRSpace[Task](store)
+        (rspace, replay, hr) = spaces
+        runtime              <- Runtime.createWithEmptyCost((rspace, replay), Seq.empty)
+        runtimeManager       <- RuntimeManager.fromRuntime[Task](runtime)
+        dag                  <- blockDagStorage.getRepresentation
+        _                    <- InterpreterUtil.validateBlockCheckpoint[Task](genesis, dag, runtimeManager)
+        _                    <- Validate.bondsCache[Task](genesis, runtimeManager) shouldBeF Right(Valid)
+        modifiedBonds        = Seq.empty[Bond]
+        modifiedPostState    = genesis.body.state.copy(bonds = modifiedBonds.toList)
+        modifiedBody         = genesis.body.copy(state = modifiedPostState)
+        modifiedGenesis      = genesis.copy(body = modifiedBody)
         result <- Validate.bondsCache[Task](modifiedGenesis, runtimeManager) shouldBeF Left(
                    InvalidBondsCache
                  )
-        _ <- activeRuntime.close()
       } yield result
   }
 
@@ -754,7 +754,7 @@ class ValidateTest
         sender           = ByteString.copyFrom(pk.bytes)
         latestMessageOpt <- dag.latestMessage(sender)
         seqNum           = latestMessageOpt.fold(0)(_.seqNum) + 1
-        genesis = ValidatorIdentity[Task](sk)
+        genesis = ValidatorIdentity(sk)
           .signBlock(context.genesisBlock.copy(seqNum = seqNum))
         _ <- Validate.formatOfFields[Task](genesis) shouldBeF true
         _ <- Validate.formatOfFields[Task](genesis.copy(blockHash = ByteString.EMPTY)) shouldBeF false
@@ -779,7 +779,7 @@ class ValidateTest
         dag              <- blockDagStorage.getRepresentation
         latestMessageOpt <- dag.latestMessage(sender)
         seqNum           = latestMessageOpt.fold(0)(_.seqNum) + 1
-        genesis = ValidatorIdentity[Task](sk)
+        genesis = ValidatorIdentity(sk)
           .signBlock(context.genesisBlock.copy(seqNum = seqNum))
         _ <- Validate.blockHash[Task](genesis) shouldBeF Right(Valid)
         result <- Validate.blockHash[Task](
@@ -796,7 +796,7 @@ class ValidateTest
       dag              <- blockDagStorage.getRepresentation
       latestMessageOpt <- dag.latestMessage(sender)
       seqNum           = latestMessageOpt.fold(0)(_.seqNum) + 1
-      genesis = ValidatorIdentity[Task](sk).signBlock(
+      genesis = ValidatorIdentity(sk).signBlock(
         context.genesisBlock.copy(seqNum = seqNum)
       )
       _      <- Validate.version[Task](genesis, -1) shouldBeF false

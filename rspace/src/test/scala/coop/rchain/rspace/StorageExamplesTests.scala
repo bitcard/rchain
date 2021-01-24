@@ -7,7 +7,6 @@ import cats.instances.parallel._
 import coop.rchain.rspace.examples.AddressBookExample
 import coop.rchain.rspace.examples.AddressBookExample._
 import coop.rchain.rspace.examples.AddressBookExample.implicits._
-import coop.rchain.rspace.history.Branch
 import coop.rchain.rspace.util._
 import coop.rchain.rspace.test._
 import scodec.Codec
@@ -270,18 +269,20 @@ trait StorageExamplesTests[F[_]]
 abstract class InMemoryHotStoreStorageExamplesTestsBase[F[_]]
     extends StorageTestsBase[F, Channel, Pattern, Entry, EntriesCaptor] {
 
-  implicit val channelCodec: Codec[Channel] = AddressBookExample.implicits.serializeChannel.toCodec
-  implicit val patternCodec: Codec[Pattern] = AddressBookExample.implicits.serializePattern.toCodec
-  implicit val entryCodec: Codec[Entry]     = AddressBookExample.implicits.serializeInfo.toCodec
+  implicit val channelCodec: Codec[Channel] =
+    AddressBookExample.implicits.serializeChannel.toSizeHeadCodec
+  implicit val patternCodec: Codec[Pattern] =
+    AddressBookExample.implicits.serializePattern.toSizeHeadCodec
+  implicit val entryCodec: Codec[Entry] = AddressBookExample.implicits.serializeInfo.toSizeHeadCodec
   implicit val entryCaptorCodec: Codec[EntriesCaptor] =
-    AddressBookExample.implicits.serializeEntriesCaptor.toCodec
+    AddressBookExample.implicits.serializeEntriesCaptor.toSizeHeadCodec
 
   override def fixture[R](f: (ST, AtST, T) => F[R]): R = {
-    val creator: (HR, ST, Branch) => F[(ST, AtST, T)] =
-      (hr, ts, b) => {
+    val creator: (HR, ST) => F[(ST, AtST, T)] =
+      (hr, ts) => {
         val atomicStore = AtomicAny(ts)
         val space =
-          new RSpace[F, Channel, Pattern, Entry, EntriesCaptor](hr, atomicStore, b)
+          new RSpace[F, Channel, Pattern, Entry, EntriesCaptor](hr, atomicStore)
         Applicative[F].pure((ts, atomicStore, space))
       }
     setupTestingSpace(creator, f)

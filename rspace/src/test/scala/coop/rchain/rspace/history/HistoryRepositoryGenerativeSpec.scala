@@ -4,7 +4,6 @@ import cats.effect.Sync
 import java.nio.file.{Files, Path}
 
 import coop.rchain.rspace.{
-  Blake2b256Hash,
   DeleteContinuations,
   DeleteData,
   DeleteJoins,
@@ -24,9 +23,11 @@ import scodec.Codec
 import monix.execution.Scheduler.Implicits.global
 import cats.implicits._
 import coop.rchain.rspace.internal.{Datum, WaitingContinuation}
+import coop.rchain.rspace.state.instances.{RSpaceExporterStore, RSpaceImporterStore}
 import org.lmdbjava.EnvFlags
 import coop.rchain.shared.PathOps._
 import coop.rchain.shared.Serialize
+import coop.rchain.store.{InMemoryKeyValueStore, InMemoryStoreManager, KeyValueStoreManager}
 
 import scala.concurrent.duration._
 
@@ -36,30 +37,27 @@ class LMDBHistoryRepositoryGenerativeSpec
 
   val dbDir: Path = Files.createTempDirectory("rchain-storage-test-")
 
-  def lmdbConfig =
-    StoreConfig(
-      Files.createTempDirectory(dbDir, "test-"),
-      1024L * 1024L * 4096L,
-      2,
-      2048,
-      List(EnvFlags.MDB_NOTLS)
-    )
+  val kvm = InMemoryStoreManager[Task]
 
   override def repo: Task[HistoryRepository[Task, String, Pattern, String, StringsCaptor]] =
     for {
-      historyLmdbStore <- StoreInstances.lmdbStore[Task](lmdbConfig)
-      historyStore     = HistoryStoreInstances.historyStore(historyLmdbStore)
-      coldLmdbStore    <- StoreInstances.lmdbStore[Task](lmdbConfig)
-      coldStore        = ColdStoreInstances.coldStore(coldLmdbStore)
-      rootsLmdbStore   <- StoreInstances.lmdbStore[Task](lmdbConfig)
-      rootsStore       = RootsStoreInstances.rootsStore(rootsLmdbStore)
-      rootRepository   = new RootRepository[Task](rootsStore)
-      emptyHistory     = HistoryInstances.merging(History.emptyRootHash, historyStore)
+      historyLmdbKVStore <- kvm.store("history")
+      historyStore       = HistoryStoreInstances.historyStore(historyLmdbKVStore)
+      coldLmdbKVStore    <- kvm.store("cold")
+      coldStore          = ColdStoreInstances.coldStore(coldLmdbKVStore)
+      rootsLmdbKVStore   <- kvm.store("roots")
+      rootsStore         = RootsStoreInstances.rootsStore(rootsLmdbKVStore)
+      rootRepository     = new RootRepository[Task](rootsStore)
+      emptyHistory       = HistoryInstances.merging(History.emptyRootHash, historyStore)
+      exporter           = RSpaceExporterStore[Task](historyLmdbKVStore, coldLmdbKVStore, rootsLmdbKVStore)
+      importer           = RSpaceImporterStore[Task](historyLmdbKVStore, coldLmdbKVStore, rootsLmdbKVStore)
       repository: HistoryRepository[Task, String, Pattern, String, StringsCaptor] = HistoryRepositoryImpl
         .apply[Task, String, Pattern, String, StringsCaptor](
           emptyHistory,
           rootRepository,
-          coldStore
+          coldStore,
+          exporter,
+          importer
         )
     } yield repository
 
@@ -78,10 +76,13 @@ class InmemHistoryRepositoryGenerativeSpec
       HistoryRepositoryImpl.apply[Task, String, Pattern, String, StringsCaptor](
         emptyHistory,
         rootRepository,
-        inMemColdStore
+        inMemColdStore,
+        emptyExporter,
+        emptyImporter
       )
     repository.pure[Task]
   }
+
 }
 
 abstract class HistoryRepositoryGenerativeDefinition
@@ -90,9 +91,9 @@ abstract class HistoryRepositoryGenerativeDefinition
     with OptionValues
     with GeneratorDrivenPropertyChecks {
 
-  implicit val codecString: Codec[String]   = implicitly[Serialize[String]].toCodec
-  implicit val codecP: Codec[Pattern]       = implicitly[Serialize[Pattern]].toCodec
-  implicit val codecK: Codec[StringsCaptor] = implicitly[Serialize[StringsCaptor]].toCodec
+  implicit val codecString: Codec[String]   = implicitly[Serialize[String]].toSizeHeadCodec
+  implicit val codecP: Codec[Pattern]       = implicitly[Serialize[Pattern]].toSizeHeadCodec
+  implicit val codecK: Codec[StringsCaptor] = implicitly[Serialize[StringsCaptor]].toSizeHeadCodec
 
   implicit def noShrink[T]: Shrink[T] = Shrink.shrinkAny
 
@@ -140,7 +141,9 @@ abstract class HistoryRepositoryGenerativeDefinition
       case InsertJoins(channel: String, joins) =>
         repo.getJoins(channel).map(checkJoins(_, joins))
       case InsertContinuations(channels, conts) =>
-        repo.getContinuations(channels.asInstanceOf[Seq[String]]).map(checkContinuations(_, conts))
+        repo
+          .getContinuations(channels.asInstanceOf[Seq[String]])
+          .map(checkContinuations(_, conts))
       case DeleteData(channel: String) =>
         repo.getData(channel).map(_ shouldBe empty)
       case DeleteJoins(channel: String) =>

@@ -1,13 +1,11 @@
 package coop.rchain.casper.protocol
 
-import java.io.IOException
-
 import com.google.protobuf.ByteString
 import coop.rchain.comm.protocol.routing.Packet
 import enumeratum._
 import scalapb.{GeneratedMessage, GeneratedMessageCompanion, Message}
 
-import scala.util.{Failure, Try}
+import scala.util.Try
 
 sealed abstract class PacketTypeTag extends EnumEntry
 
@@ -23,6 +21,9 @@ object PacketTypeTag extends Enum[PacketTypeTag] {
   case object BlockApproval            extends PacketTypeTag
   case object UnapprovedBlock          extends PacketTypeTag
   case object NoApprovedBlockAvailable extends PacketTypeTag
+  // Last finalized state messages
+  case object StoreItemsMessageRequest extends PacketTypeTag
+  case object StoreItemsMessage        extends PacketTypeTag
 
   override val values = findValues
 
@@ -52,6 +53,11 @@ object PacketTypeTag extends Enum[PacketTypeTag] {
     implicit val valueOfApprovedBlockAvailable: ValueOf[NoApprovedBlockAvailable.type] = summon(
       NoApprovedBlockAvailable
     )
+    // Last finalized state messages
+    implicit val valueOfStoreItemsMessageRequest: ValueOf[StoreItemsMessageRequest.type] =
+      summon(StoreItemsMessageRequest)
+    implicit val valueOfStoreItemsMessage: ValueOf[StoreItemsMessage.type] =
+      summon(StoreItemsMessage)
   }
 
 }
@@ -80,7 +86,7 @@ object PacketParseResult {
   @inline def fromTry[A](a: Try[A]): PacketParseResult[A] = a.fold(Failure, Success(_))
 }
 
-import PacketParseResult._
+import coop.rchain.casper.protocol.PacketParseResult._
 
 trait FromPacket[Tag <: PacketTypeTag] {
   type To
@@ -92,7 +98,7 @@ trait FromPacket[Tag <: PacketTypeTag] {
 }
 
 object FromPacket {
-  def protoImpl[Tag <: PacketTypeTag, A <: GeneratedMessage with Message[A]](
+  def protoImpl[Tag <: PacketTypeTag, A <: GeneratedMessage](
       implicit companion: GeneratedMessageCompanion[A],
       witness0: ValueOf[Tag]
   ): FromPacket[Tag] { type To = A } = new FromPacket[Tag] {
@@ -118,7 +124,7 @@ object ToPacket {
     override val witness                             = witness0
     protected override def content(a: A): ByteString = a.toByteString
   }
-  implicit def protoSerde[Tag0 <: PacketTypeTag, A0 <: GeneratedMessage with Message[A0]](
+  implicit def protoSerde[Tag0 <: PacketTypeTag, A0 <: GeneratedMessage](
       implicit de: FromPacket[Tag0] { type To = A0 }
   ): ToPacket[A0] { type Tag = Tag0 } = protoMessageImpl[A0, Tag0](de.witness)
 }
